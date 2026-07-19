@@ -1,0 +1,69 @@
+version: "3.9"
+
+# AITOS foundation infra stack (spec section 3.2).
+# Only Redis is consumed by the current codebase (Event Bus transport).
+# ClickHouse (time-series/logs) and Neo4j (knowledge graph) are included
+# now so the Data Layer and Knowledge Graph modules can plug straight in
+# without an infra rewrite later.
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: aitos-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - aitos_redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: aitos-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # native protocol
+    environment:
+      CLICKHOUSE_DB: aitos
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - aitos_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.19-community
+    container_name: aitos-neo4j
+    ports:
+      - "7474:7474"  # HTTP browser
+      - "7687:7687"  # Bolt protocol
+    environment:
+      NEO4J_AUTH: neo4j/changeme
+      NEO4J_dbms_memory_pagecache_size: 512M
+      NEO4J_dbms_memory_heap_max__size: 1G
+    volumes:
+      - aitos_neo4j_data:/data
+      - aitos_neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  aitos_redis_data:
+  aitos_clickhouse_data:
+  aitos_neo4j_data:
+  aitos_neo4j_logs:
