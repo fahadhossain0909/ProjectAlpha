@@ -1,31 +1,21 @@
+# Secrets -- never commit real credentials
+.env
+
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-
-# Virtual Environment
+*.egg-info/
 .venv/
 venv/
-env/
 
-# Environment Variables
-.env
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
 
-# VS Code
-.vscode/
-
-# PyCharm
-.idea/
-
-# Logs
-logs/
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
-
-# macOS
+# OS/editor cruft
 .DS_Store
+*.swp
 
-# Windows
-Thumbs.db
+# Local Docker overrides, if you use one
+docker-compose.override.yml

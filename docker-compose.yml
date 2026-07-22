@@ -62,6 +62,66 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # -- Application containers ---------------------------------------------------
+  # Both build from the same image (./Dockerfile); only the command differs.
+  # *_HOST/*_URI below point at the other services by their Compose network
+  # name (e.g. "redis", not "localhost") -- everything else (log level,
+  # Binance credentials, etc.) still comes from .env via env_file.
+
+  aitos-paper:
+    build: .
+    container_name: aitos-paper
+    command: ["python3", "run_paper_trading.py"]
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      CLICKHOUSE_HOST: clickhouse
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      - "8090:8090"  # health/metrics -- see aitos/health_server.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # LIVE TRADING -- real orders, real money. Requires BINANCE_API_KEY/
+  # BINANCE_API_SECRET in .env, and needs an interactive terminal for its
+  # startup confirmation (aitos/live_trading.py) -- run it with
+  # `docker compose run --rm aitos-live`, NOT `docker compose up -d`,
+  # or the confirmation prompt has no stdin to read from. Deliberately
+  # excluded from the default Compose profile and given no restart
+  # policy -- see deploy/aitos-live.service for why.
+  aitos-live:
+    build: .
+    container_name: aitos-live
+    command: ["python3", "run_live_trading.py"]
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      CLICKHOUSE_HOST: clickhouse
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      - "8091:8091"
+    stdin_open: true
+    tty: true
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["live"]
+
 volumes:
   aitos_redis_data:
   aitos_clickhouse_data:

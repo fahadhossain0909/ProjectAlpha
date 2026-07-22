@@ -67,7 +67,8 @@ together, not just individually.
 | systemd unit files (daemonization guidance) | `deploy/aitos-paper.service`, `deploy/aitos-live.service` | ✅ implemented |
 | Structured JSON logging | `aitos/logging_setup.py` | ✅ implemented |
 | Config (Redis / ClickHouse / Neo4j / Binance credentials) | `aitos/config/settings.py` | ✅ implemented |
-| Docker Compose (Redis, ClickHouse, Neo4j) | `docker-compose.yml` | ✅ ready to run |
+| Docker Compose (Redis, ClickHouse, Neo4j, app) | `docker-compose.yml`, `Dockerfile` | ✅ ready to run |
+| GitHub → VPS Docker deployment guide | `DEPLOY.md` | ✅ implemented |
 | Saliency maps | — | 🚫 not applicable — no image/spatial data in this system |
 
 Everything above is real, working, tested code — not stubs. The Decision
@@ -108,6 +109,12 @@ quick smoke test against the real API on your own machine before relying
 on it for anything live.
 
 ## Quickstart
+
+This section is for running things locally. Deploying to a VPS (GCP,
+Oracle Cloud, etc.) via Docker end-to-end, from a GitHub clone to a
+running system, is covered in **[DEPLOY.md](DEPLOY.md)** — the app itself
+now builds into a container too (`Dockerfile`), alongside the
+Redis/ClickHouse/Neo4j infra `docker-compose.yml` already managed.
 
 ### 1. Start infrastructure
 
