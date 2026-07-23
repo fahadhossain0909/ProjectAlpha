@@ -2,14 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, develop]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, develop]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: Lint & Code Quality
 
     steps:
       - name: Check out repository
@@ -18,20 +23,180 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install flake8 black isort pylint
 
-      - name: Run test suite
+      - name: Run Black formatter check
+        run: black --check .
+        continue-on-error: true
+
+      - name: Run isort import checker
+        run: isort --check-only .
+        continue-on-error: true
+
+      - name: Run Flake8 linter
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    name: Unit Tests
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest pytest-cov
+
+      - name: Create .env file from secrets for tests
+        run: |
+          cat > .env << EOF
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          API_KEY=${{ secrets.API_KEY }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          DEBUG=true
+          TESTING=true
+          EOF
+
+      - name: Run tests with pytest
         env:
           PYTHONPATH: .
-        run: pytest -q
+        run: pytest --cov=. --cov-report=xml --cov-report=html --junitxml=junit/test-results-${{ matrix.python-version }}.xml -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: junit/test-results-${{ matrix.python-version }}.xml
+
+  security:
+    runs-on: ubuntu-latest
+    name: Security Scan
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit safety
+
+      - name: Run Bandit security scan
+        run: bandit -r . -f json -o bandit-report.json
+        continue-on-error: true
+
+      - name: Check dependencies for vulnerabilities
+        run: safety check --json
+        continue-on-error: true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: bandit-report.json
+
+  docker-validate:
+    runs-on: ubuntu-latest
+    name: Docker & Compose Validation
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create .env file
+        run: |
+          if [ -f .env.example ]; then
+            cp .env.example .env
+          else
+            cat > .env << EOF
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          API_KEY=${{ secrets.API_KEY }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          EOF
+          fi
 
       - name: Validate Docker Compose configuration
+        run: docker compose config >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ github.repository }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  results:
+    runs-on: ubuntu-latest
+    name: CI Results
+    needs: [lint, test, security, docker-validate]
+    if: always()
+
+    steps:
+      - name: Determine CI status
+        id: ci-status
         run: |
-          cp .env.example .env
-          docker compose config >/dev/null
+          if [ "${{ needs.lint.result }}" == "failure" ] || \
+             [ "${{ needs.test.result }}" == "failure" ] || \
+             [ "${{ needs.security.result }}" == "failure" ] || \
+             [ "${{ needs.docker-validate.result }}" == "failure" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "status=passed" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${{ steps.ci-status.outputs.emoji }} **CI Pipeline: ${{ steps.ci-status.outputs.status }}**\n\n| Step | Status |\n|------|--------|\n| Linting | ${{ needs.lint.result }} |\n| Tests | ${{ needs.test.result }} |\n| Security | ${{ needs.security.result }} |\n| Docker | ${{ needs.docker-validate.result }} |`
+            })
