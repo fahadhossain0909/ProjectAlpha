@@ -10,6 +10,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
   publish-image:
     runs-on: ubuntu-latest
@@ -19,10 +22,24 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Create .env file from secrets
+        run: |
+          cat > .env << EOF
+          # Environment variables created from GitHub Secrets
+          DEPLOY_HOST=${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER=${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY=${{ secrets.DEPLOY_SSH_KEY }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          API_KEY=${{ secrets.API_KEY }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          DEBUG=${{ secrets.DEBUG || false }}
+          EOF
+          echo ".env file created successfully"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -30,7 +47,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -66,6 +83,17 @@ jobs:
             else
               git pull
             fi
-            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+            
+            # Create .env file on deployment server
+            cat > .env << 'ENVEOF'
+            DEPLOY_HOST=${{ secrets.DEPLOY_HOST }}
+            DEPLOY_USER=${{ secrets.DEPLOY_USER }}
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            API_KEY=${{ secrets.API_KEY }}
+            SECRET_KEY=${{ secrets.SECRET_KEY }}
+            DEBUG=${{ secrets.DEBUG || false }}
+            ENVEOF
+            
+            docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
             docker compose pull
             docker compose up -d --build
