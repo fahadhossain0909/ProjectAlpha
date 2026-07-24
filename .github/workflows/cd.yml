@@ -117,12 +117,19 @@ jobs:
             docker compose pull
             docker compose up -d --build
 
+            # Debug: list running containers and their health
+            echo "=== Container status after startup ==="
+            docker compose ps --all
+            echo "=== ClickHouse inspect (first 30 lines) ==="
+            docker inspect aitos-clickhouse 2>/dev/null | head -30 || echo "container not found yet"
+            echo "========================================"
+
             # Wait for ClickHouse to become healthy (with logs on failure)
             echo "Waiting for ClickHouse to become healthy..."
             status=""
-            for i in $(seq 1 30); do
+            for i in $(seq 1 60); do
               status=$(docker inspect --format='{{json .State.Health.Status}}' aitos-clickhouse 2>/dev/null || echo "null")
-              echo "[$i/30] clickhouse status: $status"
+              echo "[$i/60] clickhouse status: $status"
               if [ "$status" = '"healthy"' ]; then
                 echo "ClickHouse is healthy"
                 break
