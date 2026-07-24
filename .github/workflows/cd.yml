@@ -86,6 +86,16 @@ jobs:
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
 
+      - name: Check system resources
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: |
+          echo "=== Memory ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
+          echo "=== Docker info ==="
+          docker info --format '{{.DriverStatus}}' 2>/dev/null || true
+
       - name: Deploy to remote host over SSH
         if: steps.check-secrets.outputs.has_secrets == 'true'
         uses: appleboy/ssh-action@v1.2.5
@@ -114,6 +124,11 @@ jobs:
             ENVEOF
             
             docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+            # Validate compose config before pulling
+            echo "Validating docker-compose configuration..."
+            docker compose config > /dev/null || exit 1
+
             docker compose pull
             docker compose up -d --build
 
@@ -127,12 +142,17 @@ jobs:
             # Wait for ClickHouse to become healthy (with logs on failure)
             echo "Waiting for ClickHouse to become healthy..."
             status=""
-            for i in $(seq 1 60); do
+            for i in $(seq 1 120); do
               status=$(docker inspect --format='{{json .State.Health.Status}}' aitos-clickhouse 2>/dev/null || echo "null")
-              echo "[$i/60] clickhouse status: $status"
+              echo "[$i/120] clickhouse status: $status"
               if [ "$status" = '"healthy"' ]; then
                 echo "ClickHouse is healthy"
                 break
+              fi
+              # Print logs every 30 iterations to debug slow startup
+              if [ $((i % 30)) -eq 0 ]; then
+                echo "=== ClickHouse logs (iteration $i) ==="
+                docker compose logs --tail=50 aitos-clickhouse 2>/dev/null || true
               fi
               sleep 10
             done
