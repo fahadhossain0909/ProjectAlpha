@@ -69,10 +69,19 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: publish-image
-    if: secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_SSH_KEY != ''
 
     steps:
+      - name: Check required secrets
+        id: check-secrets
+        run: |
+          if [ -n "${{ secrets.DEPLOY_HOST }}" ] && [ -n "${{ secrets.DEPLOY_USER }}" ] && [ -n "${{ secrets.DEPLOY_SSH_KEY }}" ]; then
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Deploy to remote host over SSH
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.DEPLOY_HOST }}
