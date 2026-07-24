@@ -90,9 +90,15 @@ class DataIngestionService(AITOSModule):
 
     async def health_check(self) -> HealthStatus:
         alive = sum(1 for t in self._tasks if not t.done())
-        status = ModuleStatus.HEALTHY if alive == len(self._tasks) else (
-            ModuleStatus.DEGRADED if alive > 0 else ModuleStatus.UNHEALTHY
-        )
+        if self._errors > 0:
+            status = ModuleStatus.UNHEALTHY
+        elif alive == 0:
+            # zero tasks with no errors = transient starting state
+            status = ModuleStatus.DEGRADED
+        elif alive < len(self._tasks):
+            status = ModuleStatus.DEGRADED
+        else:
+            status = ModuleStatus.HEALTHY
         return HealthStatus(
             module_id=self.module_id,
             status=status,

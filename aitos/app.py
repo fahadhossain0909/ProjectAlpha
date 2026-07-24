@@ -159,14 +159,23 @@ async def build_system(
     )
 
 
-async def initialize_all(components: SystemComponents) -> None:
+async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) -> None:
     """Initialize every module (dependency order — see
     ``SystemComponents.all_modules``), then subscribe the Trade Lifecycle
     to live price updates so open trades get checked automatically as new
     market data arrives — nothing does this by default, since
     ``TradeLifecycle.handle_event`` is designed to be wired explicitly
     rather than self-subscribing (a caller might want to filter/throttle
-    what reaches it)."""
+    what reaches it).
+
+    After starting all modules, polls each module's ``health_check``
+    until every module reports ``healthy`` or ``degraded`` (or the
+    *timeout* expires).  This guarantees that background tasks have had a
+    chance to start before ``initialize_all`` returns.
+    """
+    import asyncio
+    import time
+
     for module in components.all_modules():
         await module.initialize({})
 
@@ -174,7 +183,39 @@ async def initialize_all(components: SystemComponents) -> None:
         await components.event_bus.subscribe("market.kline.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices"),
         await components.event_bus.subscribe("market.trade.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices"),
     ]
-    logger.info("system fully initialized", extra={"aitos_extra": {"modules": [m.module_id for m in components.all_modules()]}})
+
+    # Wait until every module reaches at least "degraded"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ok = True
+        for module in components.all_modules():
+            health = await module.health_check()
+            if health.status.value not in ("healthy", "degraded"):
+                ok = False
+                break
+        if ok:
+            logger.info(
+                "system fully initialized",
+                extra={"aitos_extra": {"modules": [m.module_id for m in components.all_modules()]}},
+            )
+            return
+        await asyncio.sleep(0.05)
+
+    # Timeout — log which modules are still unhealthy for easier debugging
+    failed = []
+    for module in components.all_modules():
+        health = await module.health_check()
+        if health.status.value not in ("healthy", "degraded"):
+            failed.append((module.module_id, health))
+            logger.warning(
+                "module not healthy after timeout",
+                extra={"aitos_extra": {"module_id": module.module_id, "health": str(health)}},
+            )
+
+    raise RuntimeError(
+        f"Some modules failed to initialize within {timeout}s timeout: "
+        f"{[m_id for m_id, _ in failed]}"
+    )
 
 
 async def shutdown_all(components: SystemComponents, grace_period_seconds: float = 30.0) -> None:
