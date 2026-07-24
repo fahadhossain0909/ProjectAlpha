@@ -40,6 +40,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 60s
     restart: unless-stopped
 
   neo4j:
