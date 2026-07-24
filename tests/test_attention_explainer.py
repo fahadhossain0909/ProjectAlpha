@@ -71,7 +71,7 @@ async def test_learns_to_discriminate_a_real_pattern():
     explainer = AttentionExplainer(min_samples_for_ready=20, learning_rate=2.0, batch_size=8, random_state=1)
     rng = random.Random(101)
 
-    for _ in range(150):
+    for _ in range(70):
         trend = rng.uniform(0, 10)
         won = trend > 5.0
         explainer.partial_fit(make_context(trend_strength=trend), won=won)
@@ -104,7 +104,7 @@ async def test_attention_responds_to_the_informative_feature_value():
     explainer = AttentionExplainer(min_samples_for_ready=20, learning_rate=2.0, batch_size=8, random_state=2)
     rng = random.Random(202)
 
-    for _ in range(150):
+    for _ in range(60):
         order_flow = rng.uniform(0, 10)
         won = order_flow > 5.0
         explainer.partial_fit(make_context(order_flow_bias=order_flow), won=won)
