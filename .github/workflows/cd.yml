@@ -80,13 +80,19 @@ jobs:
             echo "has_secrets=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Write SSH key with proper formatting
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: |
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
       - name: Deploy to remote host over SSH
         if: steps.check-secrets.outputs.has_secrets == 'true'
         uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          key_path: /tmp/deploy_key
           script: |
             set -e
             mkdir -p ~/aitos
