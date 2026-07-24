@@ -149,10 +149,12 @@ jobs:
                 echo "ClickHouse is healthy"
                 break
               fi
-              # Print logs every 30 iterations to debug slow startup
-              if [ $((i % 30)) -eq 0 ]; then
+              # Print logs every 10 iterations for faster debugging
+              if [ $((i % 10)) -eq 0 ] || [ $i -eq 1 ]; then
                 echo "=== ClickHouse logs (iteration $i) ==="
-                docker compose logs --tail=50 aitos-clickhouse 2>/dev/null || true
+                docker compose logs --tail=100 aitos-clickhouse 2>/dev/null || true
+                echo "=== ClickHouse container health state ==="
+                docker inspect aitos-clickhouse 2>/dev/null | grep -A 10 '"Health"' || true
               fi
               sleep 10
             done
