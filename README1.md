@@ -1,8 +1,7 @@
 # AITOS — AI Trading Operating System
 
 A working, tested, real implementation of the AITOS specification —
-built phase by phase from the foundation (Event Bus, AI Kernel, Agent
-Framework) through live Binance execution, risk management, an
+built phase by phase from the foundation (Event Bus, AI Kernel, Agent Framework) through live Binance execution, risk management, an
 opportunity scanner, journaling/XAI, three self-training modules
 (Knowledge Graph, RL, SHAP+Attention), and production-supervision
 tooling — wired into two runnable systems: paper and live.
