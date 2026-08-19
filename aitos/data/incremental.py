@@ -65,6 +65,33 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+class CanonicalDataIndex:
+    """Backward-compatible index for legacy ``key/url/path`` downloads.
+
+    New dataset-aware callers should use :class:`DatasetGate` through
+    ``download_items``.  The legacy tests and callers predate the dataset
+    directory prefix, so this index recognizes their historical partition
+    layout without weakening the dataset-aware gate.
+    """
+
+    def __init__(self, parquet_root: str | Path):
+        self.root = Path(parquet_root)
+
+    def has_partition(self, key: str) -> bool:
+        try:
+            exchange, market, symbol, day = key.split("/", 3)
+        except ValueError:
+            return False
+        partition = (
+            self.root
+            / f"exchange={exchange}"
+            / f"market={market}"
+            / f"symbol={symbol.upper()}"
+            / f"date={day}"
+        )
+        return partition.is_dir() and any(partition.glob("*.parquet"))
+
+
 class IncrementalDownloader:
     """Download only data absent from its own canonical Parquet partition.
 
@@ -73,9 +100,18 @@ class IncrementalDownloader:
     partition cannot suppress a snapshot download.
     """
 
-    def __init__(self, manifest: DownloadManifest, parquet_root: str | Path):
+    def __init__(
+        self,
+        manifest: DownloadManifest,
+        parquet_root: str | Path | CanonicalDataIndex,
+    ):
         self.manifest = manifest
-        self.gate = DatasetGate(DatasetLayout(Path(parquet_root)))
+        if isinstance(parquet_root, CanonicalDataIndex):
+            self.legacy_index = parquet_root
+            self.gate = DatasetGate(DatasetLayout(parquet_root.root))
+        else:
+            self.legacy_index = CanonicalDataIndex(parquet_root)
+            self.gate = DatasetGate(DatasetLayout(Path(parquet_root)))
 
     @staticmethod
     def _manifest_key(item: DownloadItem) -> str:
@@ -86,7 +122,6 @@ class IncrementalDownloader:
         for item in items:
             key = self._manifest_key(item)
 
-            # DatasetGate is deliberately checked before manifest/raw storage.
             if not overwrite and not self.gate.should_download_raw(
                 item.dataset, item.exchange, item.market, item.symbol, item.day
             ):
@@ -127,12 +162,15 @@ class IncrementalDownloader:
     ) -> list[Path]:
         """Backward-compatible raw download API.
 
-        Legacy callers still use ``key/url/destination``. Dataset-aware callers
-        should prefer ``download_items`` so the DatasetGate can distinguish
-        trades, snapshots and updates.
+        Legacy callers still use ``key/url/destination``. If the canonical
+        partition already exists in the historical layout, no raw download is
+        needed; otherwise an existing manifest/raw file still prevents a
+        duplicate download.
         """
         downloaded: list[Path] = []
         for key, url, destination in items:
+            if not overwrite and self.legacy_index.has_partition(key):
+                continue
             if not overwrite and self.manifest.valid(key, destination):
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)

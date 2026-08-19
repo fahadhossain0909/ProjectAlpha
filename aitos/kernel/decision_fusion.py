@@ -1,12 +1,12 @@
 """Evidence-based decision fusion for the AITOS trading brain.
 
 This module replaces the old idea of treating the agent vote as the only
-source of intelligence.  It accepts directional component evidence already
+source of intelligence. It accepts directional component evidence already
 produced by the Opportunity Scanner (or future AMT/order-flow/ML/RL modules)
 and fuses the available dimensions using explicit, inspectable weights.
 
-Evidence values are normalized to the scanner's 0..10 scale.  A score of 10
-means strong support for the proposed direction; 0 means no support.  The
+Evidence values are normalized to the scanner's 0..10 scale. A score of 10
+means strong support for the proposed direction; 0 means no support. The
 fusion engine never invents a direction: callers must provide ``direction``.
 This keeps direction selection in the scanner/strategy layer while making the
 kernel responsible for confidence aggregation.
@@ -15,7 +15,7 @@ kernel responsible for confidence aggregation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 
 DEFAULT_EVIDENCE_WEIGHTS: Dict[str, float] = {
@@ -75,9 +75,9 @@ class EvidenceFusionResult:
 class DecisionFusionEngine:
     """Fuse directional evidence without hiding the underlying signals.
 
-    The engine is intentionally deterministic.  Later ML/RL models can feed
+    The engine is intentionally deterministic. Later ML/RL models can feed
     their scores through the same interface without changing downstream
-    contracts.  Only components actually present in ``component_scores`` are
+    contracts. Only components actually present in ``component_scores`` are
     included in the denominator, so a missing optional signal does not
     silently count as zero evidence.
     """
@@ -120,8 +120,8 @@ class DecisionFusionEngine:
                 missing_components=tuple(self._weights),
             )
 
-        contributions = []
-        missing = []
+        contributions: List[EvidenceContribution] = []
+        missing: List[str] = []
         denominator = 0.0
         numerator = 0.0
 
@@ -138,14 +138,14 @@ class DecisionFusionEngine:
                     weight=weight,
                     weighted_score=round(score * weight, 4),
                 )
+            )
             numerator += score * weight
             denominator += weight
 
         confidence = (numerator / denominator) / 10.0 if denominator else 0.0
-        # Below the configured threshold, the evidence is not strong enough
-        # to authorize the proposed direction.  Returning neutral here makes
-        # the gate explicit and easy to test.
-        fused_direction = direction if confidence >= self._min_confidence else "neutral"
+        fused_direction = (
+            direction if confidence >= self._min_confidence else "neutral"
+        )
 
         return EvidenceFusionResult(
             direction=fused_direction,
@@ -154,14 +154,18 @@ class DecisionFusionEngine:
             missing_components=tuple(missing),
         )
 
-    def fuse_context(self, context: Mapping[str, Any]) -> Optional[EvidenceFusionResult]:
+    def fuse_context(
+        self, context: Mapping[str, Any]
+    ) -> Optional[EvidenceFusionResult]:
         """Fuse scanner-style context when the required keys are present.
 
-        Returns ``None`` when no component evidence is supplied.  This allows
+        Returns ``None`` when no component evidence is supplied. This allows
         the existing agent-only kernel path to remain backward compatible.
         """
         direction = context.get("direction")
         component_scores = context.get("component_scores")
-        if not isinstance(direction, str) or not isinstance(component_scores, Mapping):
+        if not isinstance(direction, str) or not isinstance(
+            component_scores, Mapping
+        ):
             return None
         return self.fuse(direction, component_scores)
