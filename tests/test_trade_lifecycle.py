@@ -7,7 +7,7 @@ from aitos.core.exceptions import TradeNotFoundError
 from aitos.execution.order_executor import SimulatedOrderExecutor
 from aitos.kernel.ai_kernel import AIKernel
 from aitos.models.trade import Opportunity, TradeLifecycleState, TradeSide
-from aitos.risk.models import PortfolioState
+from aitos.risk.models import PortfolioState, PositionExposure
 from aitos.trading.lifecycle import TradeLifecycle
 
 
@@ -22,7 +22,7 @@ def make_opportunity(**overrides) -> Opportunity:
         symbol="BTCUSDT",
         side=TradeSide.LONG,
         entry_price=100.0,
-        stop_loss_price=98.0,
+        stop_loss_price=95.0,
         take_profit_levels=[104.0],
         confidence=0.8,
         strategy_id="test-strategy",
@@ -41,7 +41,7 @@ async def test_healthy_opportunity_opens_a_position(event_bus, risk_engine):
 
     assert trade.state == TradeLifecycleState.POSITION_OPENED
     assert trade.entry_price == 100.0
-    assert trade.sl_price == 98.0
+    assert trade.sl_price == 95.0
     assert trade.quantity > 0
     assert trade.leverage >= 1.0
     assert trade.trade_id in [t.trade_id for t in lifecycle.get_open_trades()]
@@ -128,9 +128,9 @@ async def test_production_opportunity_with_approval_opens(event_bus, risk_engine
 async def test_stop_loss_hit_closes_trade_at_loss(event_bus, risk_engine):
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
-    trade = await lifecycle.submit_opportunity(make_opportunity(breakeven_at_r_multiple=None), make_portfolio())
+    trade = await lifecycle.submit_opportunity(make_opportunity(stop_loss_price=97.9, breakeven_at_r_multiple=None), make_portfolio())
 
-    closed = await lifecycle.update_price(trade.trade_id, 97.5)  # below SL of 98
+    closed = await lifecycle.update_price(trade.trade_id, 97.5)  # below SL of 97.9
 
     assert closed.state == TradeLifecycleState.POSITION_CLOSED
     assert closed.exit_reason == "sl_triggered"
@@ -174,7 +174,7 @@ async def test_multi_tp_partial_close_then_final_close(event_bus, risk_engine):
 
 @pytest.mark.asyncio
 async def test_breakeven_trigger_moves_stop_to_entry(event_bus, risk_engine):
-    opportunity = make_opportunity(breakeven_at_r_multiple=1.0)  # 1R = 2.0 price units (100 -> 98 SL)
+    opportunity = make_opportunity(stop_loss_price=97.9, breakeven_at_r_multiple=1.0)  # 1R = 2.1 price units (100 -> 97.9 SL)
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(opportunity, make_portfolio())
@@ -246,7 +246,7 @@ async def test_close_trade_twice_raises_not_found(event_bus, risk_engine):
 async def test_handle_event_auto_updates_matching_open_trade(event_bus, risk_engine):
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
-    trade = await lifecycle.submit_opportunity(make_opportunity(breakeven_at_r_multiple=None), make_portfolio())
+    trade = await lifecycle.submit_opportunity(make_opportunity(stop_loss_price=97.9, breakeven_at_r_multiple=None), make_portfolio())
 
     kline_event = Event(topic=f"market.kline.BTCUSDT.1m", payload={"symbol": "BTCUSDT", "close": 97.0}, source_module="test")
     await lifecycle.handle_event(kline_event)
@@ -266,4 +266,23 @@ async def test_projected_hard_limit_rejects_oversized_candidate_before_order(eve
 
     assert trade.state == TradeLifecycleState.REJECTED
     assert "projected hard limit breach" in trade.rejection_reason
+    assert lifecycle.get_open_trades() == []
+
+
+@pytest.mark.asyncio
+async def test_projected_open_position_hard_cap_rejects_without_buffer(event_bus, risk_engine):
+    lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
+    await lifecycle.initialize({})
+
+    existing_positions = tuple(
+        PositionExposure(symbol=f"TEST{i}USDT", notional_usd=100.0, leverage=1.0)
+        for i in range(risk_engine.limits.max_open_positions_hard_cap)
+    )
+    portfolio = make_portfolio(positions=existing_positions, max_pairwise_correlation=0.0)
+
+    trade = await lifecycle.submit_opportunity(make_opportunity(symbol="BNBUSDT"), portfolio)
+
+    assert trade.state == TradeLifecycleState.REJECTED
+    assert "projected hard limit breach" in trade.rejection_reason
+    assert "max_open_positions" in trade.rejection_reason
     assert lifecycle.get_open_trades() == []
