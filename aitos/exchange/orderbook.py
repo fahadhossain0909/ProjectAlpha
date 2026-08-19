@@ -30,26 +30,29 @@ class LocalOrderBook:
         self._asks: Dict[float, float] = {}
         self.last_update_id: Optional[int] = None
         self.initialized = False
+        self._awaiting_first_update = False
 
     def seed(self, snapshot: OrderBookSnapshot) -> None:
         self._bids = {p: q for p, q in snapshot.bids if q > 0}
         self._asks = {p: q for p, q in snapshot.asks if q > 0}
         self.last_update_id = snapshot.last_update_id
         self.initialized = True
+        self._awaiting_first_update = True
 
     def apply(self, update: DepthUpdate) -> OrderBookSnapshot:
         if not self.initialized or self.last_update_id is None:
             raise OrderBookSequenceError("order book must be seeded from REST snapshot first")
         if update.final_update_id <= self.last_update_id:
             return self.snapshot(update.event_time_ms)
-        if update.first_update_id > self.last_update_id + 1:
-            raise OrderBookSequenceError(
-                f"depth gap for {self.symbol}: expected <= {self.last_update_id + 1}, got U={update.first_update_id}"
-            )
-        if update.previous_update_id and update.previous_update_id != self.last_update_id:
-            raise OrderBookSequenceError(
-                f"depth chain break for {self.symbol}: pu={update.previous_update_id}, local={self.last_update_id}"
-            )
+        if self._awaiting_first_update:
+            if not (update.first_update_id <= self.last_update_id + 1 <= update.final_update_id):
+                raise OrderBookSequenceError(f"first diff does not bridge snapshot for {self.symbol}: snapshot={self.last_update_id}, U={update.first_update_id}, u={update.final_update_id}")
+            self._awaiting_first_update = False
+        else:
+            if update.previous_update_id != self.last_update_id:
+                raise OrderBookSequenceError(f"depth chain break for {self.symbol}: pu={update.previous_update_id}, local={self.last_update_id}")
+            if update.first_update_id > self.last_update_id + 1:
+                raise OrderBookSequenceError(f"depth gap for {self.symbol}: expected={self.last_update_id + 1}, U={update.first_update_id}")
         self._apply_levels(self._bids, update.bids)
         self._apply_levels(self._asks, update.asks)
         self.last_update_id = update.final_update_id
@@ -67,16 +70,11 @@ class LocalOrderBook:
         bids = tuple(sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[: self.max_levels])
         asks = tuple(sorted(self._asks.items(), key=lambda x: x[0])[: self.max_levels])
         timestamp = datetime.fromtimestamp(event_time_ms / 1000, tz=timezone.utc) if event_time_ms else datetime.now(timezone.utc)
-        return OrderBookSnapshot(
-            symbol=self.symbol,
-            bids=bids,
-            asks=asks,
-            last_update_id=self.last_update_id or 0,
-            timestamp=timestamp,
-        )
+        return OrderBookSnapshot(symbol=self.symbol, bids=bids, asks=asks, last_update_id=self.last_update_id or 0, timestamp=timestamp)
 
     def reset(self) -> None:
         self._bids.clear()
         self._asks.clear()
         self.last_update_id = None
         self.initialized = False
+        self._awaiting_first_update = False
