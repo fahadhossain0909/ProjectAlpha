@@ -26,12 +26,12 @@ def _utc_now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 class ScanCandidate:
     symbol: str; direction: TradeSide; composite_score: float; component_scores: Dict[str, float]; rationale: List[str]; entry_price: float; atr: float; regime: str; scanned_at: str = field(default_factory=_utc_now_iso)
 def _volatility_fitness(atr_percentile: float, sweet_spot: float = 60.0, tolerance: float = 6.0) -> float: return round(max(0.0, min(10.0, 10.0 - abs(atr_percentile - sweet_spot) / tolerance)), 2)
-def determine_direction(structure_direction: str, flow_score: float) -> Optional[TradeSide]:
-    if structure_direction == "bullish_bos" and flow_score >= 5.0: return TradeSide.LONG
-    if structure_direction == "bearish_bos" and flow_score <= 5.0: return TradeSide.SHORT
+def determine_direction(structure_direction: str, cvd_score: float) -> Optional[TradeSide]:
+    if structure_direction == "bullish_bos" and cvd_score >= 5.0: return TradeSide.LONG
+    if structure_direction == "bearish_bos" and cvd_score <= 5.0: return TradeSide.SHORT
     if structure_direction == "none":
-        if flow_score >= 6.5: return TradeSide.LONG
-        if flow_score <= 3.5: return TradeSide.SHORT
+        if cvd_score >= 6.5: return TradeSide.LONG
+        if cvd_score <= 3.5: return TradeSide.SHORT
     return None
 class OpportunityScanner(AITOSModule):
     def __init__(self, event_bus: EventBus, exchange: ExchangeAdapter, symbols: List[str], timeframe: str = "15m", reference_symbol: str = "BTCUSDT", rl_scorer: Optional[RLPolicyScorer] = None, weights: Optional[Dict[str, float]] = None, min_score_threshold: float = 60.0, top_n: int = 5, kline_lookback: int = 100, trade_lookback: int = 500) -> None:
