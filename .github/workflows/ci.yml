@@ -19,26 +19,21 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
-
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install flake8 black isort pylint
-
       - name: Run Black formatter check
         run: black --check .
         continue-on-error: true
-
       - name: Run isort import checker
         run: isort --check-only .
         continue-on-error: true
-
       - name: Run Flake8 linter
         run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         continue-on-error: true
@@ -50,65 +45,48 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     timeout-minutes: 45
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
-
       - name: Verify decision_fusion.py immediately after checkout
         run: |
           set -euxo pipefail
-          echo '=== GIT STATE AFTER CHECKOUT ==='
           git rev-parse HEAD
           git status --short
-          echo '=== decision_fusion.py hashes ==='
           sha256sum aitos/kernel/decision_fusion.py
           git hash-object aitos/kernel/decision_fusion.py
           git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
-          echo '=== Python syntax check ==='
           python3 -m py_compile aitos/kernel/decision_fusion.py
-
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-
       - name: Verify decision_fusion.py after setup-python cache restore
         run: |
           set -euxo pipefail
-          echo '=== GIT STATE AFTER SETUP-PYTHON ==='
           git rev-parse HEAD
           git status --short
-          echo '=== decision_fusion.py hashes ==='
           sha256sum aitos/kernel/decision_fusion.py
           git hash-object aitos/kernel/decision_fusion.py
           git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
-          echo '=== Python syntax check ==='
           python -m py_compile aitos/kernel/decision_fusion.py
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           pip install pytest pytest-cov
-
       - name: Verify decision_fusion.py before pytest
         run: |
           set -euxo pipefail
-          echo '=== GIT STATE BEFORE PYTEST ==='
           git rev-parse HEAD
           git status --short
-          echo '=== decision_fusion.py hashes ==='
           sha256sum aitos/kernel/decision_fusion.py
           git hash-object aitos/kernel/decision_fusion.py
           git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
-          echo '=== Relevant source ==='
           nl -ba aitos/kernel/decision_fusion.py | sed -n '115,150p'
-          echo '=== Python syntax check ==='
           python -m py_compile aitos/kernel/decision_fusion.py
-
       - name: Create .env file from secrets for tests
         run: |
           cat > .env << EOF
@@ -118,7 +96,6 @@ jobs:
           DEBUG=true
           TESTING=true
           EOF
-
       - name: Diagnose decision_fusion import path
         env:
           PYTHONPATH: .
@@ -135,7 +112,6 @@ jobs:
           path = Path("aitos/kernel/decision_fusion.py").resolve()
           data = path.read_bytes()
           source = data.decode("utf-8")
-
           print("PYTHON:", sys.executable)
           print("PATH:", path)
           print("BYTES:", len(data))
@@ -149,21 +125,24 @@ jobs:
           ast.parse(source, filename=str(path))
           print("AST_PARSE: OK")
 
-          spec = importlib.util.spec_from_file_location("decision_fusion_direct", path)
+          module_name = "decision_fusion_direct"
+          spec = importlib.util.spec_from_file_location(module_name, path)
           if spec is None or spec.loader is None:
               raise RuntimeError("Could not construct import spec")
           module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
+          sys.modules[module_name] = module
+          try:
+              spec.loader.exec_module(module)
+          finally:
+              sys.modules.pop(module_name, None)
           print("DIRECT_IMPORT: OK")
           print("MODULE_FILE:", getattr(module, "__file__", None))
           print("ENGINE:", module.DecisionFusionEngine)
           PY
-
       - name: Run tests with pytest
         env:
           PYTHONPATH: .
         run: pytest --cov=. --cov-report=xml --cov-report=html --junitxml=junit/test-results-${{ matrix.python-version }}.xml -v
-
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7.0.0
         with:
@@ -171,7 +150,6 @@ jobs:
           flags: unittests
           name: codecov-umbrella
           fail_ci_if_error: false
-
       - name: Upload test results
         uses: actions/upload-artifact@v7.0.1
         if: always()
@@ -182,30 +160,24 @@ jobs:
   security:
     runs-on: ubuntu-latest
     name: Security Scan
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
-
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install security tools
         run: |
           python -m pip install --upgrade pip
           pip install bandit safety
-
       - name: Run Bandit security scan
         run: bandit -r . -f json -o bandit-report.json
         continue-on-error: true
-
       - name: Check dependencies for vulnerabilities
         run: safety check --json
         continue-on-error: true
-
       - name: Upload security reports
         uses: actions/upload-artifact@v7.0.1
         if: always()
@@ -216,11 +188,9 @@ jobs:
   docker-validate:
     runs-on: ubuntu-latest
     name: Docker & Compose Validation
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
-
       - name: Create .env file
         run: |
           if [ -f .env.example ]; then
@@ -232,17 +202,13 @@ jobs:
           SECRET_KEY=${{ secrets.SECRET_KEY }}
           EOF
           fi
-
       - name: Validate Docker Compose configuration
         run: docker compose config >/dev/null
-
       - name: Lowercase repository name
         id: repo
         run: echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.2.0
-
       - name: Build Docker image
         uses: docker/build-push-action@v7.3.0
         with:
@@ -257,7 +223,6 @@ jobs:
     name: CI Results
     needs: [lint, test, security, docker-validate]
     if: always()
-
     steps:
       - name: Determine CI status
         id: ci-status
@@ -273,7 +238,6 @@ jobs:
             echo "status=passed" >> $GITHUB_OUTPUT
             echo "emoji=✅" >> $GITHUB_OUTPUT
           fi
-
       - name: Comment on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v9.0.0
