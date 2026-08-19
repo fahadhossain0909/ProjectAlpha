@@ -80,10 +80,16 @@ class LiquidityTracker:
         if not trades:
             return []
         events: list[LiquidityEvent] = []
-        prev_bid_qty = sum(q for _, q in previous.bids)
-        prev_ask_qty = sum(q for _, q in previous.asks)
-        curr_bid_qty = sum(q for _, q in current.bids)
-        curr_ask_qty = sum(q for _, q in current.asks)
+        # Always normalize book levels first: OrderBookSnapshot may expose either
+        # tuple/list levels or mapping-style levels depending on the adapter.
+        prev_bids = self._side_map(previous.bids)
+        prev_asks = self._side_map(previous.asks)
+        curr_bids = self._side_map(current.bids)
+        curr_asks = self._side_map(current.asks)
+        prev_bid_qty = sum(prev_bids.values())
+        prev_ask_qty = sum(prev_asks.values())
+        curr_bid_qty = sum(curr_bids.values())
+        curr_ask_qty = sum(curr_asks.values())
         buy_qty = sum(t.quantity for t in trades if not t.is_buyer_maker and t.side == TradeSide.BUY)
         sell_qty = sum(t.quantity for t in trades if t.is_buyer_maker or t.side == TradeSide.SELL)
         if prev_ask_qty > 0 and curr_ask_qty / prev_ask_qty < 1.0 - self.removal_ratio and buy_qty > 0:
