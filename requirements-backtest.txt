@@ -1,0 +1,3 @@
+# Optional dependencies for historical backtesting
+pyarrow>=15,<23
+pytest>=8,<9
