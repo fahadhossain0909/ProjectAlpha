@@ -1,16 +1,4 @@
-"""System wiring — the piece that turns 244 passing unit tests into an
-actual running system. ``build_system`` assembles every module built
-across this project's phases into one coherent whole;
-``run_scan_and_trade_cycle`` is the paper-trading loop's single unit of
-work (scan → rank → size → submit).
-
-Deliberately split from ``run_paper_trading.py`` (the real-infra CLI
-entrypoint) so the wiring logic itself — dependency order, event
-subscriptions, shutdown sequencing — can be unit tested against the same
-fakes used throughout this test suite (fakeredis, a fake exchange
-adapter, ``SimulatedOrderExecutor``) without needing Redis/ClickHouse/
-Neo4j/Binance actually running. See ``tests/test_app_wiring.py``.
-"""
+"""System wiring for the AITOS trading application."""
 
 from __future__ import annotations
 
@@ -29,7 +17,7 @@ from aitos.intelligence.rl_policy import RLPolicyScorer, TabularBanditRLScorer
 from aitos.intelligence.scanner import OpportunityScanner
 from aitos.journal.journal_system import JournalSystem
 from aitos.journal.repository import JournalRepository
-from aitos.kernel.ai_kernel import AIKernel
+from aitos.kernel.ai_kernel import AIKernel, DecisionContext
 from aitos.knowledge_graph.correlation_updater import SymbolCorrelationUpdater
 from aitos.knowledge_graph.writer import GraphDriver, KnowledgeGraphWriter
 from aitos.logging_setup import get_logger
@@ -48,10 +36,6 @@ logger = get_logger("aitos.app")
 
 @dataclass
 class SystemComponents:
-    """Every module in the system, plus a couple of raw handles
-    (``rl_scorer``, ``outcome_classifier``) that aren't themselves
-    ``AITOSModule``s but are what makes the feedback loops useful."""
-
     event_bus: EventBus
     kernel: AIKernel
     risk_engine: RiskEngine
@@ -71,305 +55,164 @@ class SystemComponents:
     _price_feed_subscriptions: List[Subscription] = field(default_factory=list)
 
     def all_modules(self) -> List[AITOSModule]:
-        """Dependency order: things other modules publish/subscribe to or
-        depend on come first, so their consumers never miss startup."""
-        modules: List[AITOSModule] = [
-            self.event_bus, self.kernel, self.risk_engine,
-            self.journal, self.rl_feedback, self.ml_feedback, self.attention_feedback,
-        ]
-        if self.knowledge_graph is not None:
-            modules.append(self.knowledge_graph)
+        modules: List[AITOSModule] = [self.event_bus, self.kernel, self.risk_engine, self.journal,
+            self.rl_feedback, self.ml_feedback, self.attention_feedback]
+        if self.knowledge_graph is not None: modules.append(self.knowledge_graph)
         modules += [self.data_ingestion, self.scanner, self.trade_lifecycle]
-        if self.reconciliation is not None:
-            modules.append(self.reconciliation)
-        if self.correlation_updater is not None:
-            modules.append(self.correlation_updater)
+        if self.reconciliation is not None: modules.append(self.reconciliation)
+        if self.correlation_updater is not None: modules.append(self.correlation_updater)
         return modules
 
 
-async def build_system(
-    event_bus: EventBus,
-    exchange: ExchangeAdapter,
-    order_executor: OrderExecutor,
-    symbols: List[str],
-    kline_timeframe: str = "15m",
-    scanner_timeframe: str = "15m",
-    market_data_repository: Optional[MarketDataRepository] = None,
-    journal_repository: Optional[JournalRepository] = None,
-    graph_driver: Optional[GraphDriver] = None,
-    risk_limits: Optional[RiskLimits] = None,
-    kernel: Optional[AIKernel] = None,
-    rl_scorer: Optional[RLPolicyScorer] = None,
-    use_exchange_side_stops: bool = False,
-    min_score_threshold: float = 60.0,
-    top_n: int = 5,
-) -> SystemComponents:
-    """Construct every module, wired together. Does NOT call
-    ``initialize()`` on anything — see ``initialize_all``. Splitting
-    construction from initialization means a caller can inspect/adjust
-    components (e.g. swap in a different ``RLPolicyScorer``) before
-    anything starts subscribing or running background loops.
-    """
+async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_executor: OrderExecutor,
+                       symbols: List[str], kline_timeframe: str = "15m", scanner_timeframe: str = "15m",
+                       market_data_repository: Optional[MarketDataRepository] = None,
+                       journal_repository: Optional[JournalRepository] = None, graph_driver: Optional[GraphDriver] = None,
+                       risk_limits: Optional[RiskLimits] = None, kernel: Optional[AIKernel] = None,
+                       rl_scorer: Optional[RLPolicyScorer] = None, use_exchange_side_stops: bool = False,
+                       min_score_threshold: float = 60.0, top_n: int = 5) -> SystemComponents:
     kernel = kernel or AIKernel(event_bus=event_bus)
     risk_engine = RiskEngine(event_bus=event_bus, limits=risk_limits)
-
     rl_scorer = rl_scorer or TabularBanditRLScorer()
-    scanner = OpportunityScanner(
-        event_bus=event_bus, exchange=exchange, symbols=symbols, timeframe=scanner_timeframe,
-        rl_scorer=rl_scorer, min_score_threshold=min_score_threshold, top_n=top_n,
-    )
+    scanner = OpportunityScanner(event_bus=event_bus, exchange=exchange, symbols=symbols,
+        timeframe=scanner_timeframe, rl_scorer=rl_scorer, min_score_threshold=min_score_threshold, top_n=top_n)
     rl_feedback = RLFeedbackLoop(event_bus=event_bus, scorer=rl_scorer)
-
     outcome_classifier = TradeOutcomeClassifier()
     ml_feedback = MLExplainerFeedbackLoop(event_bus=event_bus, classifier=outcome_classifier)
-
     attention_explainer = AttentionExplainer()
     attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
-
-    trade_lifecycle = TradeLifecycle(
-        event_bus=event_bus, risk_engine=risk_engine, order_executor=order_executor,
-        kernel=kernel, use_exchange_side_stops=use_exchange_side_stops,
-    )
-
-    data_ingestion = DataIngestionService(
-        exchange=exchange, event_bus=event_bus, symbols=symbols,
-        kline_timeframe=kline_timeframe, repository=market_data_repository,
-    )
-
+    trade_lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine, order_executor=order_executor,
+        kernel=kernel, use_exchange_side_stops=use_exchange_side_stops)
+    data_ingestion = DataIngestionService(exchange=exchange, event_bus=event_bus, symbols=symbols,
+        kline_timeframe=kline_timeframe, repository=market_data_repository)
     journal = JournalSystem(event_bus=event_bus, repository=journal_repository, risk_engine=risk_engine)
-
     reconciliation = None
     if order_executor.supports_exchange_side_stops and use_exchange_side_stops:
         reconciliation = ReconciliationScheduler(trade_lifecycle=trade_lifecycle, event_bus=event_bus)
-
-    knowledge_graph = None
-    correlation_updater = None
+    knowledge_graph = correlation_updater = None
     if graph_driver is not None:
         knowledge_graph = KnowledgeGraphWriter(event_bus=event_bus, driver=graph_driver)
-        correlation_updater = SymbolCorrelationUpdater(
-            exchange=exchange, graph_writer=knowledge_graph, symbols=symbols, timeframe=scanner_timeframe
-        )
-
-    return SystemComponents(
-        event_bus=event_bus, kernel=kernel, risk_engine=risk_engine, data_ingestion=data_ingestion,
-        scanner=scanner, trade_lifecycle=trade_lifecycle, journal=journal, rl_scorer=rl_scorer,
-        rl_feedback=rl_feedback, outcome_classifier=outcome_classifier, ml_feedback=ml_feedback,
-        attention_explainer=attention_explainer, attention_feedback=attention_feedback,
-        reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater,
-    )
+        correlation_updater = SymbolCorrelationUpdater(exchange=exchange, graph_writer=knowledge_graph,
+            symbols=symbols, timeframe=scanner_timeframe)
+    return SystemComponents(event_bus=event_bus, kernel=kernel, risk_engine=risk_engine,
+        data_ingestion=data_ingestion, scanner=scanner, trade_lifecycle=trade_lifecycle, journal=journal,
+        rl_scorer=rl_scorer, rl_feedback=rl_feedback, outcome_classifier=outcome_classifier,
+        ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
+        reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
 
 async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) -> None:
-    """Initialize every module (dependency order — see
-    ``SystemComponents.all_modules``), then subscribe the Trade Lifecycle
-    to live price updates so open trades get checked automatically as new
-    market data arrives — nothing does this by default, since
-    ``TradeLifecycle.handle_event`` is designed to be wired explicitly
-    rather than self-subscribing (a caller might want to filter/throttle
-    what reaches it).
-
-    After starting all modules, polls each module's ``health_check``
-    until every module reports ``healthy`` or ``degraded`` (or the
-    *timeout* expires).  This guarantees that background tasks have had a
-    chance to start before ``initialize_all`` returns.
-    """
     import asyncio
     import time
-
-    for module in components.all_modules():
-        await module.initialize({})
-
+    for module in components.all_modules(): await module.initialize({})
     components._price_feed_subscriptions = [
         await components.event_bus.subscribe("market.kline.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices"),
         await components.event_bus.subscribe("market.trade.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices"),
     ]
-
-    # Wait until every module reaches at least "degraded"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        ok = True
-        for module in components.all_modules():
-            health = await module.health_check()
-            if health.status.value not in ("healthy", "degraded"):
-                ok = False
-                break
-        if ok:
-            logger.info(
-                "system fully initialized",
-                extra={"aitos_extra": {"modules": [m.module_id for m in components.all_modules()]}},
-            )
+        if all((await module.health_check()).status.value in ("healthy", "degraded") for module in components.all_modules()):
+            logger.info("system fully initialized", extra={"aitos_extra": {"modules": [m.module_id for m in components.all_modules()]}})
             return
         await asyncio.sleep(0.05)
-
-    # Timeout — log which modules are still unhealthy for easier debugging
     failed = []
     for module in components.all_modules():
         health = await module.health_check()
         if health.status.value not in ("healthy", "degraded"):
             failed.append((module.module_id, health))
-            logger.warning(
-                "module not healthy after timeout",
-                extra={"aitos_extra": {"module_id": module.module_id, "health": str(health)}},
-            )
-
-    raise RuntimeError(
-        f"Some modules failed to initialize within {timeout}s timeout: "
-        f"{[m_id for m_id, _ in failed]}"
-    )
+            logger.warning("module not healthy after timeout", extra={"aitos_extra": {"module_id": module.module_id, "health": str(health)}})
+    raise RuntimeError(f"Some modules failed to initialize within {timeout}s timeout: {[m_id for m_id, _ in failed]}")
 
 
 async def shutdown_all(components: SystemComponents, grace_period_seconds: float = 30.0) -> None:
-    for sub in components._price_feed_subscriptions:
-        sub.cancel()
+    for sub in components._price_feed_subscriptions: sub.cancel()
     for module in reversed(components.all_modules()):
-        try:
-            await module.shutdown(grace_period_seconds)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("error shutting down module", extra={"aitos_extra": {"module_id": module.module_id, "error": str(exc)}})
+        try: await module.shutdown(grace_period_seconds)
+        except Exception as exc: logger.error("error shutting down module", extra={"aitos_extra": {"module_id": module.module_id, "error": str(exc)}})
 
 
 class PortfolioTracker(Protocol):
-    """Structural interface both ``PaperPortfolioTracker`` and
-    ``LivePortfolioTracker`` satisfy — ``run_scan_and_trade_cycle`` only
-    needs this one method."""
-
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState: ...
 
 
 @dataclass
 class PaperPortfolioTracker:
-    """Minimal equity/exposure tracker for paper trading — real deployments
-    would pull equity from the exchange's account endpoint instead."""
-
     starting_equity_usd: float = 10_000.0
     _peak_equity_usd: float = field(init=False)
-
-    def __post_init__(self) -> None:
-        self._peak_equity_usd = self.starting_equity_usd
-
+    def __post_init__(self) -> None: self._peak_equity_usd = self.starting_equity_usd
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState:
-        closed = trade_lifecycle.get_closed_trades()
-        open_trades = trade_lifecycle.get_open_trades()
-
+        closed, open_trades = trade_lifecycle.get_closed_trades(), trade_lifecycle.get_open_trades()
         realized_pnl = sum(t.pnl for t in closed if t.pnl is not None)
         equity = self.starting_equity_usd + realized_pnl
         self._peak_equity_usd = max(self._peak_equity_usd, equity)
-
-        now = datetime.now(timezone.utc)
-        day_ago, week_ago = now - timedelta(days=1), now - timedelta(days=7)
+        now, day_ago, week_ago = datetime.now(timezone.utc), datetime.now(timezone.utc)-timedelta(days=1), datetime.now(timezone.utc)-timedelta(days=7)
         daily_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= day_ago)
         weekly_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= week_ago)
-
-        positions = tuple(
-            PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage)
-            for t in open_trades
-        )
+        positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades)
         regime_counts: Dict[str, int] = {}
-        for t in open_trades:
-            regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
+        for t in open_trades: regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
-
-        return PortfolioState(
-            equity_usd=equity,
-            peak_equity_usd=self._peak_equity_usd,
-            positions=positions,
-            daily_pnl_pct=(daily_pnl / equity * 100) if equity else 0.0,
-            weekly_pnl_pct=(weekly_pnl / equity * 100) if equity else 0.0,
-            regime=dominant_regime,
-        )
+        return PortfolioState(equity_usd=equity, peak_equity_usd=self._peak_equity_usd, positions=positions,
+            daily_pnl_pct=(daily_pnl/equity*100) if equity else 0.0, weekly_pnl_pct=(weekly_pnl/equity*100) if equity else 0.0, regime=dominant_regime)
 
 
-def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+def _parse_iso(value: str) -> datetime: return datetime.fromisoformat(value)
 
 
 class LivePortfolioTracker:
-    """Real portfolio tracker for live trading — pulls actual equity from
-    the exchange's account balance endpoint instead of simulating it.
-
-    Peak equity is tracked in-memory for the life of this process only
-    (a real long-running deployment would want to persist this — e.g. in
-    ClickHouse alongside the journal — so drawdown tracking survives a
-    restart; left as a documented gap rather than built here, since it
-    needs a storage decision this reference script shouldn't make for you).
-    """
-
     def __init__(self, order_executor, asset: str = "USDT") -> None:
-        self._order_executor = order_executor
-        self._asset = asset
+        self._order_executor, self._asset = order_executor, asset
         self._peak_equity_usd: Optional[float] = None
-        self._last_known_equity_usd: float = 0.0
-
+        self._last_known_equity_usd = 0.0
     async def refresh_equity(self) -> float:
         equity = await self._order_executor.get_account_balance(self._asset)
         self._last_known_equity_usd = equity
         self._peak_equity_usd = equity if self._peak_equity_usd is None else max(self._peak_equity_usd, equity)
         return equity
-
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState:
-        """Uses the equity from the most recent ``refresh_equity()`` call —
-        call that first each cycle (querying the exchange is an async I/O
-        call this synchronous method can't make itself)."""
         open_trades = trade_lifecycle.get_open_trades()
-        positions = tuple(
-            PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage)
-            for t in open_trades
-        )
+        positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades)
         regime_counts: Dict[str, int] = {}
-        for t in open_trades:
-            regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
+        for t in open_trades: regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
-
-        return PortfolioState(
-            equity_usd=self._last_known_equity_usd,
-            peak_equity_usd=self._peak_equity_usd or self._last_known_equity_usd,
-            positions=positions,
-            regime=dominant_regime,
-        )
+        return PortfolioState(equity_usd=self._last_known_equity_usd, peak_equity_usd=self._peak_equity_usd or self._last_known_equity_usd,
+            positions=positions, regime=dominant_regime)
 
 
-async def run_scan_and_trade_cycle(
-    components: SystemComponents,
-    portfolio_tracker: "PortfolioTracker",
-    is_production: bool = False,
-    approved_by: Optional[str] = None,
-) -> int:
-    """One full cycle: scan every tracked symbol, rank candidates, size and
-    submit the top ones as opportunities. Returns how many opportunities
-    were submitted (opened or rejected — both are legitimate outcomes).
-
-    ``is_production``/``approved_by`` are forwarded to every submitted
-    ``Opportunity`` — leave both at their defaults for paper trading.
-    Setting ``is_production=True`` routes every submission through
-    ``AIKernel.enforce_governance``, which requires ``approved_by`` to be
-    set or every opportunity is rejected — see ``run_live_trading.py`` for
-    how that approval is actually obtained (a human, at startup, not a
-    per-trade rubber stamp).
-    """
+async def run_scan_and_trade_cycle(components: SystemComponents, portfolio_tracker: PortfolioTracker,
+                                   is_production: bool = False, approved_by: Optional[str] = None) -> int:
     refresh = getattr(portfolio_tracker, "refresh_equity", None)
-    if refresh is not None:
-        await refresh()
-
+    if refresh is not None: await refresh()
     portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle)
     await components.risk_engine.assess(portfolio)
-
     candidates = await components.scanner.scan_all()
     ranked = await components.scanner.rank(candidates)
-
     open_symbols = {t.symbol for t in components.trade_lifecycle.get_open_trades()}
     submitted = 0
     for candidate in ranked:
-        if candidate.symbol in open_symbols:
-            continue  # don't stack multiple opportunities on a symbol we're already in
+        if candidate.symbol in open_symbols: continue
+
+        # The scanner's ten-dimensional evidence now passes through the
+        # central AI Kernel before an Opportunity can reach TradeLifecycle.
+        decision = await components.scanner.decide_with_kernel(candidate, components.kernel)
+        if decision.direction != candidate.direction.value:
+            logger.info("kernel vetoed scanner direction", extra={"aitos_extra": {
+                "symbol": candidate.symbol, "scanner_direction": candidate.direction.value,
+                "kernel_direction": decision.direction, "confidence": decision.confidence,
+            }})
+            continue
+        if decision.confidence < components.kernel.fusion_min_confidence:
+            logger.info("kernel confidence gate rejected candidate", extra={"aitos_extra": {
+                "symbol": candidate.symbol, "confidence": decision.confidence,
+            }})
+            continue
+
         opportunity = components.scanner.to_opportunity(candidate, is_production=is_production, approved_by=approved_by)
+        opportunity.confidence = min(opportunity.confidence, decision.confidence)
+        opportunity.rationale = f"kernel_confidence={decision.confidence:.4f}; " + opportunity.rationale
         current_portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle)
         trade = await components.trade_lifecycle.submit_opportunity(opportunity, current_portfolio)
         submitted += 1
-        logger.info(
-            "opportunity submitted",
-            extra={"aitos_extra": {"symbol": candidate.symbol, "state": trade.state.value, "trade_id": trade.trade_id}},
-        )
-        if trade.state == TradeLifecycleState.POSITION_OPENED:
-            open_symbols.add(candidate.symbol)
-
+        logger.info("opportunity submitted", extra={"aitos_extra": {"symbol": candidate.symbol, "state": trade.state.value, "trade_id": trade.trade_id}})
+        if trade.state == TradeLifecycleState.POSITION_OPENED: open_symbols.add(candidate.symbol)
     return submitted
