@@ -76,6 +76,8 @@ def test_determine_direction_no_structure_relies_on_strong_cvd():
 
 @pytest.mark.asyncio
 async def test_scan_symbol_passes_direction_and_component_scores_to_rl_scorer(event_bus):
+    """Regression test: the RL scorer's context previously omitted
+    'direction', silently merging long/short buckets together."""
     from aitos.intelligence.rl_policy import RLPolicyScorer
 
     captured_contexts = []
@@ -165,3 +167,37 @@ async def test_to_opportunity_places_atr_based_sl_and_r_multiple_tps(event_bus):
     candidate = await scanner.scan_symbol("BTCUSDT")
 
     opportunity = scanner.to_opportunity(candidate, risk_reward_multiples=(1.0, 2.0, 3.0), atr_stop_multiplier=1.5)
+
+    assert opportunity.side == TradeSide.LONG
+    assert opportunity.stop_loss_price < opportunity.entry_price
+    stop_distance = opportunity.entry_price - opportunity.stop_loss_price
+    assert len(opportunity.take_profit_levels) == 3
+    assert opportunity.take_profit_levels[0] == pytest.approx(opportunity.entry_price + stop_distance * 1.0)
+    assert opportunity.take_profit_levels[2] == pytest.approx(opportunity.entry_price + stop_distance * 3.0)
+    assert opportunity.trailing_sl_enabled is True
+    assert 0.0 <= opportunity.confidence <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_scanner_to_lifecycle_end_to_end(event_bus, risk_engine):
+    """Full pipeline: scan -> rank -> build Opportunity -> Trade Lifecycle opens a position."""
+    exchange = FakeScannerExchange()
+    scanner = OpportunityScanner(
+        event_bus=event_bus, exchange=exchange, symbols=["BTCUSDT", "ETHUSDT"], reference_symbol="", min_score_threshold=0.0
+    )
+    await scanner.initialize({})
+    lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
+    await lifecycle.initialize({})
+
+    candidates = await scanner.scan_all()
+    ranked = await scanner.rank(candidates)
+    assert ranked
+
+    opportunity = scanner.to_opportunity(ranked[0])
+    portfolio = PortfolioState(equity_usd=10_000.0, peak_equity_usd=10_000.0, volatility_percentile=30.0)
+
+    trade = await lifecycle.submit_opportunity(opportunity, portfolio)
+
+    assert trade.state.value == "position_opened"
+    assert trade.symbol == "BTCUSDT"
+    assert len(trade.take_profit_levels) == 3
