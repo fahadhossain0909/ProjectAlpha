@@ -1,6 +1,7 @@
 """End-to-end historical runner with L2 execution and futures margin."""
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Iterable
 from aitos.backtest.market_adapter import HistoricalMarketAdapter, HistoricalMarketState
 from aitos.backtest.replay import MarketReplay
@@ -76,7 +77,8 @@ class ProjectAlphaHistoricalRunner:
                 if event.best_bid > 0 and event.best_ask > 0:
                     last_price = (event.best_bid + event.best_ask) / 2.0
             if funding_rate is not None and last_funding_time != event.timestamp:
-                self.margin.apply_funding(funding_rate(event.timestamp), last_price) if last_price > 0 else None
+                if last_price > 0:
+                    self.margin.apply_funding(funding_rate(event.timestamp), last_price)
                 last_funding_time = event.timestamp
             if last_price > 0 and self.margin.check_liquidation(last_price):
                 break
