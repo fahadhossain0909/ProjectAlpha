@@ -17,6 +17,7 @@ from aitos.intelligence.footprint_signals import FootprintSignalEngine
 from aitos.intelligence.orderflow_liquidity_interaction import FlowLiquidityInteractionEngine
 from aitos.intelligence.open_interest import oi_trend_score
 from aitos.intelligence.order_flow_engine import OrderFlowEngine
+from aitos.intelligence.live_scanner import LiveScannerCache
 from aitos.intelligence.rl_policy import NeutralRLScorer, RLPolicyScorer
 from aitos.logging_setup import get_logger
 from aitos.models.market import OpenInterest
@@ -38,61 +39,67 @@ def determine_direction(structure_direction: str, cvd_score: float) -> Optional[
         if cvd_score <= 3.5: return TradeSide.SHORT
     return None
 class OpportunityScanner(AITOSModule):
-    def __init__(self, event_bus: EventBus, exchange: ExchangeAdapter, symbols: List[str], timeframe: str = "15m", reference_symbol: str = "BTCUSDT", rl_scorer: Optional[RLPolicyScorer] = None, weights: Optional[Dict[str, float]] = None, min_score_threshold: float = 60.0, top_n: int = 5, kline_lookback: int = 100, trade_lookback: int = 500, footprint_tick_sizes: Optional[Dict[str, float]] = None) -> None:
-        self._event_bus, self._exchange, self._symbols = event_bus, exchange, symbols; self._timeframe, self._reference_symbol = timeframe, reference_symbol; self._rl_scorer = rl_scorer or NeutralRLScorer(); self._weights = weights or DEFAULT_WEIGHTS; self._min_score_threshold, self._top_n = min_score_threshold, top_n; self._kline_lookback, self._trade_lookback = kline_lookback, trade_lookback; self._footprint_tick_sizes = footprint_tick_sizes or {}; self._initialized = False; self._last_oi: Dict[str, OpenInterest] = {}; self._last_scan_at: Optional[str] = None; self._last_candidate_count = 0; self._liquidity_trackers: Dict[str, LiquidityTracker] = {}; self._footprint_engines: Dict[str, FootprintEngine] = {}; self._footprint_signal_engine = FootprintSignalEngine(); self._interaction_engine = FlowLiquidityInteractionEngine()
+    def __init__(self, event_bus: EventBus, exchange: ExchangeAdapter, symbols: List[str], timeframe: str = "15m", reference_symbol: str = "BTCUSDT", rl_scorer: Optional[RLPolicyScorer] = None, weights: Optional[Dict[str, float]] = None, min_score_threshold: float = 60.0, top_n: int = 5, kline_lookback: int = 100, trade_lookback: int = 500, footprint_tick_sizes: Optional[Dict[str, float]] = None, live_state_stale_seconds: float = 5.0) -> None:
+        self._event_bus, self._exchange, self._symbols = event_bus, exchange, symbols; self._timeframe, self._reference_symbol = timeframe, reference_symbol; self._rl_scorer = rl_scorer or NeutralRLScorer(); self._weights = weights or DEFAULT_WEIGHTS; self._min_score_threshold, self._top_n = min_score_threshold, top_n; self._kline_lookback, self._trade_lookback = kline_lookback, trade_lookback; self._footprint_tick_sizes = footprint_tick_sizes or {}; self._live_state_stale_seconds = max(0.5, live_state_stale_seconds); self._initialized = False; self._last_oi: Dict[str, OpenInterest] = {}; self._last_scan_at: Optional[str] = None; self._last_candidate_count = 0; self._liquidity_trackers: Dict[str, LiquidityTracker] = {}; self._footprint_engines: Dict[str, FootprintEngine] = {}; self._footprint_signal_engine = FootprintSignalEngine(); self._interaction_engine = FlowLiquidityInteractionEngine(); self._live_cache = LiveScannerCache(event_bus, symbols, max_trades=max(5000, trade_lookback))
     @property
     def module_id(self) -> str: return "opportunity-scanner"
     @property
-    def version(self) -> str: return "1.6.0"
+    def version(self) -> str: return "1.7.0"
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
-        await self._exchange.connect()
-        # Prefer explicit configuration, but automatically populate missing
-        # footprint tick sizes from Binance exchange metadata. This keeps
-        # price-level bucketing aligned with the exchange's PRICE_FILTER.
+        await self._exchange.connect(); await self._live_cache.initialize()
         missing = [s for s in self._symbols if s not in self._footprint_tick_sizes]
         if missing:
             try:
                 filters = await self._exchange.fetch_exchange_info(missing)
                 for symbol, symbol_filter in filters.items():
-                    if symbol_filter.tick_size > 0:
-                        self._footprint_tick_sizes[symbol] = symbol_filter.tick_size
+                    if symbol_filter.tick_size > 0: self._footprint_tick_sizes[symbol] = symbol_filter.tick_size
                 logger.info("loaded footprint tick sizes", extra={"aitos_extra": {"symbols": list(filters), "missing": [s for s in missing if s not in self._footprint_tick_sizes]}})
-            except Exception as exc:
-                logger.warning("could not auto-load footprint tick sizes; footprint remains neutral for missing symbols", extra={"aitos_extra": {"error": str(exc), "symbols": missing}})
+            except Exception as exc: logger.warning("could not auto-load footprint tick sizes; footprint remains neutral for missing symbols", extra={"aitos_extra": {"error": str(exc), "symbols": missing}})
         self._initialized = True
-    async def health_check(self) -> HealthStatus: return HealthStatus(module_id=self.module_id, status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY, latency_ms=0.0, last_event_time=self._last_scan_at, details={"last_candidate_count": self._last_candidate_count, "symbols_tracked": len(self._symbols), "footprint_tick_sizes_loaded": len(self._footprint_tick_sizes)})
-    async def shutdown(self, grace_period_seconds: float = 30.0) -> None: await self._exchange.close()
-    async def emit_events(self) -> AsyncIterator[Event]:
-        return
-        yield
+    async def health_check(self) -> HealthStatus:
+        return HealthStatus(module_id=self.module_id, status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY, latency_ms=0.0, last_event_time=self._last_scan_at, details={"last_candidate_count": self._last_candidate_count, "symbols_tracked": len(self._symbols), "footprint_tick_sizes_loaded": len(self._footprint_tick_sizes), "live_state_symbols": sum(1 for s in self._symbols if self._live_cache.snapshot(s) is not None)})
+    async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
+        await self._live_cache.shutdown(); await self._exchange.close()
+    async def emit_events(self) -> AsyncIterator[Event]: return
     async def handle_event(self, event: Event) -> Optional[EventResponse]: return None
     def _footprint_tick_size(self, symbol: str) -> Optional[float]:
-        tick = self._footprint_tick_sizes.get(symbol)
-        return tick if tick is not None and tick > 0 else None
+        tick = self._footprint_tick_sizes.get(symbol); return tick if tick is not None and tick > 0 else None
+    def _live_market_data(self, symbol: str) -> tuple[list, Any, bool]:
+        state = self._live_cache.snapshot(symbol)
+        if state is None or state.last_trade_at is None or state.last_book_at is None: return [], None, False
+        now = datetime.now(timezone.utc); trade_age = (now - state.last_trade_at).total_seconds(); book_age = (now - state.last_book_at).total_seconds()
+        fresh = trade_age <= self._live_state_stale_seconds and book_age <= self._live_state_stale_seconds
+        return list(state.trades), state.order_book, fresh
     async def scan_symbol(self, symbol: str, reference_klines: Optional[list] = None) -> Optional[ScanCandidate]:
         self._require_initialized(); klines = await self._exchange.fetch_klines(symbol, self._timeframe, limit=self._kline_lookback)
         if len(klines) < 20: return None
-        order_book = await self._exchange.fetch_order_book(symbol, limit=20); trades = await self._exchange.fetch_recent_trades(symbol, limit=self._trade_lookback); funding = await self._exchange.fetch_funding_rate(symbol); oi_current = await self._exchange.fetch_open_interest(symbol); oi_previous = self._last_oi.get(symbol)
+        live_trades, live_book, live_fresh = self._live_market_data(symbol)
+        if live_fresh and live_trades and live_book is not None:
+            trades, order_book = live_trades[-self._trade_lookback:], live_book
+            market_source = "websocket_live_state"
+        else:
+            order_book = await self._exchange.fetch_order_book(symbol, limit=20); trades = await self._exchange.fetch_recent_trades(symbol, limit=self._trade_lookback); market_source = "rest_fallback"
+        funding = await self._exchange.fetch_funding_rate(symbol); oi_current = await self._exchange.fetch_open_interest(symbol); oi_previous = self._last_oi.get(symbol)
         atr = indicators.average_true_range(klines); vol_percentile = indicators.atr_percentile(klines); regime = indicators.classify_regime(klines); structure_direction, structure_strength = indicators.detect_structure_break(klines)
         flow_features = OrderFlowEngine(max_trades=max(100, self._trade_lookback)).ingest_many(trades) if trades else None
         candle_cvd = indicators.cvd_trend_score(klines); flow_score = flow_features.bias_score if flow_features else candle_cvd; direction = determine_direction(structure_direction, flow_score); self._last_oi[symbol] = oi_current
         if direction is None: return None
         trend_score = min(10.0, indicators.adx(klines) / 10.0); volatility_score = _volatility_fitness(vol_percentile); regime_score = REGIME_FIT_SCORE.get(regime, 5.0); liquidity_score = liquidity_intelligence_score(order_book, trades); lead_lag = indicators.lead_lag_score(klines, reference_klines) if reference_klines and symbol != self._reference_symbol else 5.0; funding_score = funding_rate_score(funding, direction); price_moved_up = klines[-1].close > klines[0].close; oi_score = oi_trend_score(oi_current, oi_previous, direction, price_moved_up); auction_score = auction_context_score(klines, direction.value)
-        tracker = self._liquidity_trackers.setdefault(symbol, LiquidityTracker()); liquidity_events = tracker.update(order_book, trades)
+        tracker = self._liquidity_trackers.setdefault(symbol, LiquidityTracker())
+        if live_fresh and live_book is not None:
+            # Events are already generated continuously by the live ingestion path.
+            liquidity_events = tracker.update(live_book, trades[-self._trade_lookback:])
+        else:
+            liquidity_events = tracker.update(order_book, trades)
         tick_size = self._footprint_tick_size(symbol)
         if tick_size is not None and trades:
             footprint_engine = self._footprint_engines.setdefault(symbol, FootprintEngine(tick_size)); footprint = footprint_engine.build(trades); footprint_signals = self._footprint_signal_engine.evaluate(footprint); interaction = self._interaction_engine.evaluate(footprint_signals, liquidity_events)
-            if interaction.direction == "neutral": interaction_score = 5.0
-            elif interaction.direction == direction.value: interaction_score = 5.0 + interaction.score * 0.5
-            else: interaction_score = max(0.0, 5.0 - interaction.score * 0.5)
-            interaction_score = round(min(10.0, max(0.0, interaction_score)), 2)
-            interaction_rationale = f"footprint={footprint_signals.bias}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}, tick_size={tick_size:g}"
+            interaction_score = 5.0 if interaction.direction == "neutral" else 5.0 + interaction.score * 0.5 if interaction.direction == direction.value else max(0.0, 5.0 - interaction.score * 0.5); interaction_score = round(min(10.0, max(0.0, interaction_score)), 2); interaction_rationale = f"footprint={footprint_signals.bias}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}, tick_size={tick_size:g}, source={market_source}"
         else:
-            interaction_score = 5.0
-            interaction_rationale = "footprint=not_configured; interaction=neutral"
+            interaction_score = 5.0; interaction_rationale = "footprint=not_configured; interaction=neutral"
         rl_context = {"regime": regime, "direction": direction.value, "trend_strength": trend_score, "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "footprint_interaction": interaction_score}; rl_score = await self._rl_scorer.score(symbol, rl_context)
-        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2), "footprint_interaction": interaction_score}; weight_total = sum(self._weights.get(k, 0.0) for k in component_scores); composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) / weight_total * 10 if weight_total else 0.0; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}")
+        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2), "footprint_interaction": interaction_score}; weight_total = sum(self._weights.get(k, 0.0) for k in component_scores); composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) / weight_total * 10 if weight_total else 0.0; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}, market_source={market_source}")
         if flow_features: rationale.append(f"orderflow delta={flow_features.delta:.4f}, cvd={flow_features.cvd:.4f}, buy_ratio={flow_features.buy_ratio:.3f}, aggression={flow_features.aggression:.3f}, vwap={flow_features.vwap:.4f}")
         rationale.append(interaction_rationale); rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
         return ScanCandidate(symbol=symbol, direction=direction, composite_score=round(composite, 2), component_scores=component_scores, rationale=rationale, entry_price=klines[-1].close, atr=atr, regime=regime)
