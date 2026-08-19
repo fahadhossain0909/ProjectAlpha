@@ -1,8 +1,4 @@
-"""Integrated deterministic backtest runner.
-
-Connects replay events to a user-supplied strategy/execution callback and
-computes portfolio performance metrics without hiding execution assumptions.
-"""
+"""Integrated deterministic backtest runner."""
 from __future__ import annotations
 from dataclasses import dataclass
 from math import sqrt
@@ -30,22 +26,13 @@ class BacktestResult:
     equity_curve: tuple[float, ...]
 
 class BacktestEngine:
-    """Replay events and record equity after each marked event.
-
-    The strategy callback owns signal generation and calls ``execute`` when it
-    wants a fill. This keeps the engine agnostic to the live strategy code.
-    """
+    """Replay events and record equity after each marked event."""
     def __init__(self, initial_cash: float, fee_rate: float = 0.0004, slippage_bps: float = 0.0) -> None:
         self.execution = ExecutionSimulator(initial_cash, fee_rate, slippage_bps)
         self.initial_cash = initial_cash
         self._trade_pnls: list[float] = []
 
-    def run(
-        self,
-        events: Iterable[ReplayEvent],
-        strategy: Callable[[ReplayEvent, ExecutionSimulator], None],
-        mark_price: Callable[[ReplayEvent], float],
-    ) -> BacktestResult:
+    def run(self, events: Iterable[ReplayEvent], strategy: Callable[[ReplayEvent, ExecutionSimulator], None], mark_price: Callable[[ReplayEvent], float]) -> BacktestResult:
         curve: list[float] = []
         replay = MarketReplay(events)
         for event in replay.events:
@@ -60,7 +47,7 @@ class BacktestEngine:
 
     def _metrics(self, curve: list[float]) -> BacktestMetrics:
         final = curve[-1] if curve else self.initial_cash
-        total_return = (final / self.initial_cash) - 1.0
+        total_return = round((final / self.initial_cash) - 1.0, 12)
         peak = self.initial_cash
         max_dd = 0.0
         for equity in curve:
