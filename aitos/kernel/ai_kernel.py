@@ -1,17 +1,7 @@
-"""AI Kernel — the central orchestrator of AITOS.
-
-Responsibilities (per spec section 4.2):
-- Maintains a World State snapshot
-- Routes events to registered agents
-- Coordinates the Decision Fusion Engine (weighted-consensus placeholder;
-  swap in AMT/Liquidity/OrderFlow/ML/DL/RL scoring as those modules land)
-- Enforces governance rules — no production action without explicit human
-  approval, per the AI Constitution's Non-Negotiables
-"""
+"""AI Kernel — central orchestrator of AITOS."""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -25,6 +15,7 @@ from aitos.core.exceptions import (
     ModuleNotInitializedError,
 )
 from aitos.eventbus.redis_bus import EventBus
+from aitos.kernel.decision_fusion import DecisionFusionEngine
 from aitos.logging_setup import get_logger
 
 logger = get_logger("aitos.kernel")
@@ -32,8 +23,6 @@ logger = get_logger("aitos.kernel")
 
 @dataclass
 class WorldState:
-    """A point-in-time snapshot of everything the kernel currently knows."""
-
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     active_symbols: List[str] = field(default_factory=list)
     open_positions: Dict[str, Any] = field(default_factory=dict)
@@ -44,8 +33,6 @@ class WorldState:
 
 @dataclass
 class DecisionContext:
-    """Input to ``request_decision`` — whatever the caller wants agents to weigh in on."""
-
     symbol: str
     context: Dict[str, Any] = field(default_factory=dict)
     requested_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -53,10 +40,8 @@ class DecisionContext:
 
 @dataclass
 class FusedDecision:
-    """Output of the Decision Fusion Engine — the kernel's consensus view."""
-
     symbol: str
-    direction: str  # "long" | "short" | "neutral"
+    direction: str
     confidence: float
     contributions: List[Dict[str, Any]]
     conflicting_evidence: List[str]
@@ -65,9 +50,7 @@ class FusedDecision:
 
 @dataclass
 class Action:
-    """A proposed action requiring governance review (e.g. a live order)."""
-
-    action_type: str  # "order.submit" | "config.update" | "model.deploy" | ...
+    action_type: str
     payload: Dict[str, Any]
     is_production: bool = True
     approved_by: Optional[str] = None
@@ -81,15 +64,19 @@ class GovernanceResult:
 
 
 class AIKernel(AITOSModule):
-    def __init__(self, event_bus: EventBus, require_human_approval_for_prod: bool = True) -> None:
+    def __init__(
+        self,
+        event_bus: EventBus,
+        require_human_approval_for_prod: bool = True,
+        fusion_engine: Optional[DecisionFusionEngine] = None,
+    ) -> None:
         self._event_bus = event_bus
         self._require_human_approval_for_prod = require_human_approval_for_prod
+        self._fusion_engine = fusion_engine or DecisionFusionEngine()
         self._initialized = False
         self._agents: Dict[str, BaseAgent] = {}
         self._world_state = WorldState()
         self._last_event_time: Optional[str] = None
-
-    # -- AITOSModule contract -------------------------------------------------
 
     @property
     def module_id(self) -> str:
@@ -97,7 +84,7 @@ class AIKernel(AITOSModule):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized:
@@ -131,8 +118,6 @@ class AIKernel(AITOSModule):
             await agent.handle_event(event)
         return None
 
-    # -- Kernel-specific API --------------------------------------------------
-
     async def register_agent(self, agent: BaseAgent) -> None:
         self._require_initialized()
         self._agents[agent.module_id] = agent
@@ -152,17 +137,37 @@ class AIKernel(AITOSModule):
         return self._world_state
 
     async def request_decision(self, context: DecisionContext) -> FusedDecision:
-        """Poll every registered agent for a weighted opinion and fuse them.
+        """Fuse scanner/module evidence when supplied; otherwise preserve the
+        existing agent-consensus behavior for backward compatibility.
 
-        This is a transparent, explainable weighted-vote fusion — a
-        deliberately simple placeholder for the full Decision Fusion Engine
-        (AMT + Liquidity + OrderFlow + ML + DL + RL + Risk + LeadLag + XAI,
-        spec section 3.1) which will replace the scoring logic here without
-        changing this method's contract.
+        A scanner can pass:
+        {"direction": "long", "component_scores": {"trend_strength": 8, ...}}
+        and the evidence engine becomes the authoritative confidence gate.
         """
         self._require_initialized()
+
+        evidence = self._fusion_engine.fuse_context(context.context)
+        if evidence is not None:
+            contributions = [c.to_dict() for c in evidence.contributions]
+            if evidence.missing_components:
+                contributions.append({
+                    "source": "missing_components",
+                    "components": list(evidence.missing_components),
+                })
+            return FusedDecision(
+                symbol=context.symbol,
+                direction=evidence.direction,
+                confidence=evidence.confidence,
+                contributions=contributions,
+                conflicting_evidence=(
+                    [f"insufficient evidence: {', '.join(evidence.missing_components)}"]
+                    if evidence.direction == "neutral" and evidence.missing_components
+                    else []
+                ),
+            )
+
         if not self._agents:
-            raise DecisionFusionError("No agents registered; cannot fuse a decision")
+            raise DecisionFusionError("No agents registered and no component evidence supplied")
 
         decisions: List[AgentDecision] = []
         for agent in self._agents.values():
@@ -180,7 +185,6 @@ class AIKernel(AITOSModule):
         direction_scores: Dict[str, float] = {"long": 0.0, "short": 0.0, "neutral": 0.0}
         total_weight = 0.0
         conflicting_evidence: List[str] = []
-
         for decision in decisions:
             agent = self._agents[decision.agent_id]
             weight = agent.consensus_weight * decision.confidence
@@ -188,16 +192,12 @@ class AIKernel(AITOSModule):
             total_weight += agent.consensus_weight
 
         fused_direction = max(direction_scores, key=direction_scores.get)
-        fused_confidence = (
-            direction_scores[fused_direction] / total_weight if total_weight > 0 else 0.0
-        )
-
+        fused_confidence = direction_scores[fused_direction] / total_weight if total_weight > 0 else 0.0
         directions_present = {d.direction for d in decisions}
         if len(directions_present) > 1:
             conflicting_evidence = [
                 f"{d.agent_id} voted {d.direction} ({d.confidence:.2f}): {d.rationale}"
-                for d in decisions
-                if d.direction != fused_direction
+                for d in decisions if d.direction != fused_direction
             ]
 
         return FusedDecision(
@@ -209,31 +209,21 @@ class AIKernel(AITOSModule):
         )
 
     async def enforce_governance(self, action: Action) -> GovernanceResult:
-        """Human-in-the-loop gate. Per the AI Constitution: 'No production
-        change without explicit human approval.'
-        """
         self._require_initialized()
-        if action.is_production and self._require_human_approval_for_prod:
-            if not action.approved_by:
-                result = GovernanceResult(
-                    approved=False,
-                    reason="Production action requires explicit human approval (approved_by is empty).",
-                    requires_human_approval=True,
-                )
-                logger.warning(
-                    "governance rejected action",
-                    extra={"aitos_extra": {"action_type": action.action_type}},
-                )
-                return result
+        if action.is_production and self._require_human_approval_for_prod and not action.approved_by:
+            result = GovernanceResult(
+                approved=False,
+                reason="Production action requires explicit human approval (approved_by is empty).",
+                requires_human_approval=True,
+            )
+            logger.warning("governance rejected action", extra={"aitos_extra": {"action_type": action.action_type}})
+            return result
         return GovernanceResult(approved=True, reason="Approved.", requires_human_approval=False)
 
     async def require_approval_or_raise(self, action: Action) -> None:
-        """Convenience wrapper: raises instead of returning a result object."""
         result = await self.enforce_governance(action)
         if not result.approved:
             raise GovernanceViolationError(result.reason)
-
-    # -- Internals --------------------------------------------------------------
 
     def _update_world_state_from_event(self, event: Event) -> None:
         self._world_state.updated_at = datetime.now(timezone.utc).isoformat()
