@@ -22,6 +22,11 @@ class LiveMarketStateStore:
         self._events: Dict[str, Deque[LiquidityEvent]] = defaultdict(lambda: deque(maxlen=max_liquidity_events))
         self._books: Dict[str, OrderBookSnapshot] = {}
 
+    @property
+    def trades(self) -> Dict[str, Deque[TradeTick]]:
+        """Recent trade buffers, exposed read/write for legacy ingestion callers."""
+        return self._trades
+
     def on_trade(self, trade: TradeTick) -> OrderFlowFeatures:
         self._trades[trade.symbol].append(trade)
         return self._flow[trade.symbol].ingest(trade)
