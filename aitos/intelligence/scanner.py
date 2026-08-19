@@ -43,7 +43,7 @@ class OpportunityScanner(AITOSModule):
     @property
     def module_id(self) -> str: return "opportunity-scanner"
     @property
-    def version(self) -> str: return "1.5.0"
+    def version(self) -> str: return "1.5.1"
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
         await self._exchange.connect(); self._initialized = True
@@ -53,11 +53,9 @@ class OpportunityScanner(AITOSModule):
         return
         yield
     async def handle_event(self, event: Event) -> Optional[EventResponse]: return None
-    def _footprint_tick_size(self, symbol: str) -> float:
+    def _footprint_tick_size(self, symbol: str) -> Optional[float]:
         tick = self._footprint_tick_sizes.get(symbol)
-        if tick is None or tick <= 0:
-            raise ValueError(f"missing valid footprint tick size for {symbol}; configure footprint_tick_sizes from exchange PRICE_FILTER")
-        return tick
+        return tick if tick is not None and tick > 0 else None
     async def scan_symbol(self, symbol: str, reference_klines: Optional[list] = None) -> Optional[ScanCandidate]:
         self._require_initialized(); klines = await self._exchange.fetch_klines(symbol, self._timeframe, limit=self._kline_lookback)
         if len(klines) < 20: return None
@@ -68,16 +66,21 @@ class OpportunityScanner(AITOSModule):
         if direction is None: return None
         trend_score = min(10.0, indicators.adx(klines) / 10.0); volatility_score = _volatility_fitness(vol_percentile); regime_score = REGIME_FIT_SCORE.get(regime, 5.0); liquidity_score = liquidity_intelligence_score(order_book, trades); lead_lag = indicators.lead_lag_score(klines, reference_klines) if reference_klines and symbol != self._reference_symbol else 5.0; funding_score = funding_rate_score(funding, direction); price_moved_up = klines[-1].close > klines[0].close; oi_score = oi_trend_score(oi_current, oi_previous, direction, price_moved_up); auction_score = auction_context_score(klines, direction.value)
         tracker = self._liquidity_trackers.setdefault(symbol, LiquidityTracker()); liquidity_events = tracker.update(order_book, trades)
-        footprint_engine = self._footprint_engines.setdefault(symbol, FootprintEngine(self._footprint_tick_size(symbol))); footprint = footprint_engine.build(trades); footprint_signals = self._footprint_signal_engine.evaluate(footprint); interaction = self._interaction_engine.evaluate(footprint_signals, liquidity_events)
-        if interaction.direction == "neutral": interaction_score = 5.0
-        elif interaction.direction == direction.value: interaction_score = 5.0 + interaction.score * 0.5
-        else: interaction_score = max(0.0, 5.0 - interaction.score * 0.5)
-        interaction_score = round(min(10.0, max(0.0, interaction_score)), 2)
+        tick_size = self._footprint_tick_size(symbol)
+        if tick_size is not None and trades:
+            footprint_engine = self._footprint_engines.setdefault(symbol, FootprintEngine(tick_size)); footprint = footprint_engine.build(trades); footprint_signals = self._footprint_signal_engine.evaluate(footprint); interaction = self._interaction_engine.evaluate(footprint_signals, liquidity_events)
+            if interaction.direction == "neutral": interaction_score = 5.0
+            elif interaction.direction == direction.value: interaction_score = 5.0 + interaction.score * 0.5
+            else: interaction_score = max(0.0, 5.0 - interaction.score * 0.5)
+            interaction_score = round(min(10.0, max(0.0, interaction_score)), 2)
+            interaction_rationale = f"footprint={footprint_signals.bias}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}"
+        else:
+            interaction_score = 5.0
+            interaction_rationale = "footprint=not_configured; interaction=neutral"
         rl_context = {"regime": regime, "direction": direction.value, "trend_strength": trend_score, "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "footprint_interaction": interaction_score}; rl_score = await self._rl_scorer.score(symbol, rl_context)
         component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2), "footprint_interaction": interaction_score}; weight_total = sum(self._weights.get(k, 0.0) for k in component_scores); composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) / weight_total * 10 if weight_total else 0.0; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}")
         if flow_features: rationale.append(f"orderflow delta={flow_features.delta:.4f}, cvd={flow_features.cvd:.4f}, buy_ratio={flow_features.buy_ratio:.3f}, aggression={flow_features.aggression:.3f}, vwap={flow_features.vwap:.4f}")
-        rationale.append(f"footprint={footprint_signals.bias if footprint_signals else 'neutral'}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}")
-        rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
+        rationale.append(interaction_rationale); rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
         return ScanCandidate(symbol=symbol, direction=direction, composite_score=round(composite, 2), component_scores=component_scores, rationale=rationale, entry_price=klines[-1].close, atr=atr, regime=regime)
     async def scan_all(self) -> List[ScanCandidate]:
         self._require_initialized(); reference_klines = None
