@@ -47,7 +47,7 @@ class HistoricalMarketAdapter:
     def on_trade(self, trade: TradeTick) -> None:
         if trade.symbol != self.symbol:
             raise ValueError("trade symbol does not match adapter symbol")
-        self.order_flow.update(trade)
+        self.order_flow.ingest(trade)
         self._trades.append(trade)
         if len(self._trades) > self.order_flow.max_trades:
             self._trades.pop(0)
