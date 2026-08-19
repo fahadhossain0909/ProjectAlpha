@@ -1,18 +1,16 @@
 """Domain models for market data, mirroring the ClickHouse schema in the
-AITOS spec (section 7.1: market_ohlcv, order_book_snapshots, trade_ticks)
-plus funding rate / open interest, which the spec's Opportunity Scanner
-(section 32) and Adaptive Leverage logic (section 30.2) depend on.
+AITOS spec plus funding rate / open interest.
 
-All frozen + serializable to plain dicts so they can travel as
-``Event.payload`` on the Event Bus and be written straight to ClickHouse.
+Models are immutable and serializable to/from plain dicts so they can travel
+safely through the Event Bus and be reused by live and historical pipelines.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 
 class TradeSide(str, Enum):
@@ -24,10 +22,14 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _dt(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class Kline:
-    """One OHLCV candle for a symbol/timeframe. Maps to ``market_ohlcv``."""
-
     symbol: str
     timeframe: str
     open_time: datetime
@@ -44,31 +46,18 @@ class Kline:
     is_closed: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "open_time": _iso(self.open_time),
-            "close_time": _iso(self.close_time),
-            "open": self.open,
-            "high": self.high,
-            "low": self.low,
-            "close": self.close,
-            "volume": self.volume,
-            "quote_volume": self.quote_volume,
-            "trades_count": self.trades_count,
-            "taker_buy_volume": self.taker_buy_volume,
-            "taker_buy_quote_volume": self.taker_buy_quote_volume,
-            "is_closed": self.is_closed,
-        }
+        return {"symbol": self.symbol, "timeframe": self.timeframe, "open_time": _iso(self.open_time), "close_time": _iso(self.close_time), "open": self.open, "high": self.high, "low": self.low, "close": self.close, "volume": self.volume, "quote_volume": self.quote_volume, "trades_count": self.trades_count, "taker_buy_volume": self.taker_buy_volume, "taker_buy_quote_volume": self.taker_buy_quote_volume, "is_closed": self.is_closed}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Kline":
+        return cls(symbol=data["symbol"], timeframe=data["timeframe"], open_time=_dt(data["open_time"]), close_time=_dt(data["close_time"]), open=float(data["open"]), high=float(data["high"]), low=float(data["low"]), close=float(data["close"]), volume=float(data["volume"]), quote_volume=float(data["quote_volume"]), trades_count=int(data["trades_count"]), taker_buy_volume=float(data["taker_buy_volume"]), taker_buy_quote_volume=float(data["taker_buy_quote_volume"]), is_closed=bool(data.get("is_closed", True)))
 
 
 @dataclass(frozen=True)
 class OrderBookSnapshot:
-    """Top-of-book / depth snapshot. Maps to ``order_book_snapshots``."""
-
     symbol: str
-    bids: Tuple[Tuple[float, float], ...]  # ((price, qty), ...) sorted desc by price
-    asks: Tuple[Tuple[float, float], ...]  # sorted asc by price
+    bids: Tuple[Tuple[float, float], ...]
+    asks: Tuple[Tuple[float, float], ...]
     last_update_id: int
     timestamp: datetime
 
@@ -82,51 +71,40 @@ class OrderBookSnapshot:
 
     @property
     def spread(self) -> float:
-        if not self.bids or not self.asks:
-            return 0.0
-        return self.best_ask - self.best_bid
+        return self.best_ask - self.best_bid if self.bids and self.asks else 0.0
 
     @property
     def depth_ratio(self) -> float:
-        """bid depth / ask depth across the levels we have — >1 means bid-heavy."""
         bid_depth = sum(qty for _, qty in self.bids)
         ask_depth = sum(qty for _, qty in self.asks)
         return bid_depth / ask_depth if ask_depth else float("inf")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "bid_levels": [{"price": p, "qty": q} for p, q in self.bids],
-            "ask_levels": [{"price": p, "qty": q} for p, q in self.asks],
-            "spread": self.spread,
-            "depth_ratio": self.depth_ratio,
-            "last_update_id": self.last_update_id,
-            "timestamp": _iso(self.timestamp),
-        }
+        return {"symbol": self.symbol, "bid_levels": [{"price": p, "qty": q} for p, q in self.bids], "ask_levels": [{"price": p, "qty": q} for p, q in self.asks], "spread": self.spread, "depth_ratio": self.depth_ratio, "last_update_id": self.last_update_id, "timestamp": _iso(self.timestamp)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OrderBookSnapshot":
+        bids = tuple((float(x["price"]), float(x["qty"])) for x in data.get("bid_levels", data.get("bids", [])))
+        asks = tuple((float(x["price"]), float(x["qty"])) for x in data.get("ask_levels", data.get("asks", [])))
+        return cls(symbol=data["symbol"], bids=bids, asks=asks, last_update_id=int(data["last_update_id"]), timestamp=_dt(data["timestamp"]))
 
 
 @dataclass(frozen=True)
 class TradeTick:
-    """A single executed trade. Maps to ``trade_ticks``."""
-
     symbol: str
     trade_id: int
     price: float
     quantity: float
-    side: TradeSide  # taker side
+    side: TradeSide
     is_buyer_maker: bool
     timestamp: datetime
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "trade_id": self.trade_id,
-            "price": self.price,
-            "quantity": self.quantity,
-            "side": self.side.value,
-            "is_buyer_maker": self.is_buyer_maker,
-            "timestamp": _iso(self.timestamp),
-        }
+        return {"symbol": self.symbol, "trade_id": self.trade_id, "price": self.price, "quantity": self.quantity, "side": self.side.value, "is_buyer_maker": self.is_buyer_maker, "timestamp": _iso(self.timestamp)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TradeTick":
+        return cls(symbol=data["symbol"], trade_id=int(data["trade_id"]), price=float(data["price"]), quantity=float(data["quantity"]), side=TradeSide(data["side"]), is_buyer_maker=bool(data["is_buyer_maker"]), timestamp=_dt(data["timestamp"]))
 
 
 @dataclass(frozen=True)
@@ -137,12 +115,11 @@ class FundingRate:
     mark_price: float
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "funding_rate": self.funding_rate,
-            "funding_time": _iso(self.funding_time),
-            "mark_price": self.mark_price,
-        }
+        return {"symbol": self.symbol, "funding_rate": self.funding_rate, "funding_time": _iso(self.funding_time), "mark_price": self.mark_price}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FundingRate":
+        return cls(symbol=data["symbol"], funding_rate=float(data["funding_rate"]), funding_time=_dt(data["funding_time"]), mark_price=float(data["mark_price"]))
 
 
 @dataclass(frozen=True)
@@ -152,8 +129,8 @@ class OpenInterest:
     timestamp: datetime
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "open_interest": self.open_interest,
-            "timestamp": _iso(self.timestamp),
-        }
+        return {"symbol": self.symbol, "open_interest": float(self.open_interest), "timestamp": _iso(self.timestamp)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OpenInterest":
+        return cls(symbol=data["symbol"], open_interest=float(data["open_interest"]), timestamp=_dt(data["timestamp"]))
