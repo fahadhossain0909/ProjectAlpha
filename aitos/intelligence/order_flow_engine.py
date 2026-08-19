@@ -42,8 +42,14 @@ class OrderFlowEngine:
     def __init__(self, max_trades: int = 5000) -> None:
         if max_trades < 1:
             raise ValueError("max_trades must be >= 1")
+        self._max_trades = max_trades
         self._trades: Deque[TradeTick] = deque(maxlen=max_trades)
         self._cvd = 0.0
+
+    @property
+    def max_trades(self) -> int:
+        """Configured rolling trade-window size."""
+        return self._max_trades
 
     def reset(self) -> None:
         self._trades.clear()
@@ -68,6 +74,10 @@ class OrderFlowEngine:
     @property
     def trades(self) -> tuple[TradeTick, ...]:
         return tuple(self._trades)
+
+    def snapshot(self) -> OrderFlowFeatures:
+        """Return the current normalized feature snapshot."""
+        return self.features()
 
     def features(self) -> OrderFlowFeatures:
         trades = tuple(self._trades)
