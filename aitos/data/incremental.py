@@ -1,9 +1,9 @@
-"""Incremental download and local-file validation primitives."""
+"""Incremental download and canonical-Parquet-aware local-file validation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 import hashlib
 import json
 import tempfile
@@ -49,17 +49,55 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+class CanonicalDataIndex:
+    """Answers whether a requested dataset partition already has Parquet.
+
+    A valid canonical partition is the first download gate: if it exists,
+    the raw archive must not be downloaded even when the raw file/manifest is
+    absent. This keeps disk usage and network traffic bounded.
+    """
+
+    def __init__(self, parquet_root: str | Path):
+        self.root = Path(parquet_root)
+
+    def partition_path(self, key: str) -> Path:
+        parts = key.strip("/").split("/")
+        if len(parts) != 4:
+            raise ValueError("partition key must be exchange/market/symbol/YYYY-MM-DD")
+        exchange, market, symbol, day = parts
+        return (
+            self.root
+            / f"exchange={exchange}"
+            / f"market={market}"
+            / f"symbol={symbol}"
+            / f"date={day}"
+        )
+
+    def has_partition(self, key: str) -> bool:
+        directory = self.partition_path(key)
+        return any(directory.glob("part-*.parquet"))
+
+
 class IncrementalDownloader:
-    """Download only missing/invalid files and atomically install them."""
+    """Download only data absent from both canonical Parquet and raw storage."""
 
-    def __init__(self, manifest: DownloadManifest):
+    def __init__(self, manifest: DownloadManifest, parquet_index: CanonicalDataIndex | None = None):
         self.manifest = manifest
+        self.parquet_index = parquet_index
 
-    def download(self, items: Iterable[tuple[str, str, Path]], overwrite: bool = False) -> list[Path]:
+    def download(
+        self,
+        items: Iterable[tuple[str, str, Path]],
+        overwrite: bool = False,
+    ) -> list[Path]:
         downloaded: list[Path] = []
         for key, url, destination in items:
+            # Canonical Parquet takes precedence over the raw download manifest.
+            if not overwrite and self.parquet_index and self.parquet_index.has_partition(key):
+                continue
             if not overwrite and self.manifest.valid(key, destination):
                 continue
+
             destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as tmp:
                 tmp_path = Path(tmp.name)
