@@ -8,7 +8,7 @@ book-side removal is accompanied by aggressive executed volume and price movemen
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from aitos.models.market import OrderBookSnapshot, TradeSide, TradeTick
 
@@ -30,12 +30,38 @@ class _BookState:
 class LiquidityTracker:
     def __init__(self, min_level_qty: float = 0.0, removal_ratio: float = 0.35) -> None:
         self._previous: Optional[_BookState] = None
-        self.min_level_qty = max(0.0, min_level_qty)
-        self.removal_ratio = min(0.95, max(0.05, removal_ratio))
+        self.min_level_qty = max(0.0, float(min_level_qty))
+        self.removal_ratio = min(0.95, max(0.05, float(removal_ratio)))
 
     @staticmethod
-    def _side_map(levels: Sequence[tuple[float, float]]) -> dict[float, float]:
-        return {float(price): max(0.0, float(qty)) for price, qty in levels}
+    def _side_map(levels: Sequence[Any] | Mapping[Any, Any]) -> dict[float, float]:
+        """Normalize tuple-style and mapping-style order-book levels.
+
+        Production ``OrderBookSnapshot`` instances normally contain
+        ``(price, quantity)`` tuples, while adapters/tests may expose mappings
+        such as ``{price: quantity}`` or ``{"price": ..., "qty": ...}``.
+        Keeping the normalization here makes the tracker tolerant of both
+        representations without changing the domain model.
+        """
+        if isinstance(levels, Mapping):
+            # A single level represented as {"price": ..., "qty": ...}.
+            if "price" in levels and ("qty" in levels or "quantity" in levels):
+                return {
+                    float(levels["price"]): max(
+                        0.0, float(levels.get("qty", levels.get("quantity", 0.0)))
+                    )
+                }
+            return {float(price): max(0.0, float(qty)) for price, qty in levels.items()}
+
+        normalized: dict[float, float] = {}
+        for level in levels:
+            if isinstance(level, Mapping):
+                price = level.get("price")
+                qty = level.get("qty", level.get("quantity", 0.0))
+            else:
+                price, qty = level
+            normalized[float(price)] = max(0.0, float(qty))
+        return normalized
 
     def update(self, snapshot: OrderBookSnapshot, trades: Sequence[TradeTick] = ()) -> list[LiquidityEvent]:
         events: list[LiquidityEvent] = []
@@ -63,17 +89,29 @@ class LiquidityTracker:
                     continue
                 kind = "stacking" if change > 0 else "pulling"
                 score = min(10.0, abs(change) / old_qty * 10.0)
-                events.append(LiquidityEvent(kind, side_name, round(score, 2), price, f"qty {old_qty:.6g}->{new_qty:.6g}"))
+                events.append(
+                    LiquidityEvent(
+                        kind,
+                        side_name,
+                        round(score, 2),
+                        price,
+                        f"qty {old_qty:.6g}->{new_qty:.6g}",
+                    )
+                )
         return events
 
     def _detect_sweep(self, previous: OrderBookSnapshot, current: OrderBookSnapshot, trades: Sequence[TradeTick]) -> list[LiquidityEvent]:
         if not trades:
             return []
         events: list[LiquidityEvent] = []
-        prev_bid_qty = sum(float(q) for _, q in previous.bids)
-        prev_ask_qty = sum(float(q) for _, q in previous.asks)
-        curr_bid_qty = sum(float(q) for _, q in current.bids)
-        curr_ask_qty = sum(float(q) for _, q in current.asks)
+        previous_bids = self._side_map(previous.bids)
+        previous_asks = self._side_map(previous.asks)
+        current_bids = self._side_map(current.bids)
+        current_asks = self._side_map(current.asks)
+        prev_bid_qty = sum(previous_bids.values())
+        prev_ask_qty = sum(previous_asks.values())
+        curr_bid_qty = sum(current_bids.values())
+        curr_ask_qty = sum(current_asks.values())
         buy_qty = sum(float(t.quantity) for t in trades if not t.is_buyer_maker and t.side == TradeSide.BUY)
         sell_qty = sum(float(t.quantity) for t in trades if t.is_buyer_maker or t.side == TradeSide.SELL)
         if prev_ask_qty > 0 and curr_ask_qty / prev_ask_qty < 1.0 - self.removal_ratio and buy_qty > 0:
