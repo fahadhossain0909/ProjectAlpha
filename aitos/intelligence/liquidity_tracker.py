@@ -1,14 +1,8 @@
-"""Streaming L2 liquidity state tracking.
-
-Tracks visible liquidity changes between order-book snapshots and combines them
-with executed trades to identify stacking/pulling, pressure and sweep events.
-This is deliberately conservative: a sweep is only confirmed when a meaningful
-book-side removal is accompanied by aggressive executed volume and price movement.
-"""
+"""Streaming L2 liquidity state tracking."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from aitos.models.market import OrderBookSnapshot, TradeSide, TradeTick
 
@@ -34,8 +28,27 @@ class LiquidityTracker:
         self.removal_ratio = min(0.95, max(0.05, removal_ratio))
 
     @staticmethod
-    def _side_map(levels: Sequence[tuple[float, float]]) -> dict[float, float]:
-        return {price: max(0.0, qty) for price, qty in levels}
+    def _side_map(levels: Sequence) -> dict[float, float]:
+        """Normalize tuple/list and mapping-style book levels to numeric values."""
+        normalized: dict[float, float] = {}
+        if isinstance(levels, Mapping):
+            iterator = levels.items()
+        else:
+            iterator = levels
+        for level in iterator:
+            if isinstance(level, Mapping):
+                price = level.get("price")
+                qty = level.get("quantity", level.get("qty", level.get("size")))
+            else:
+                try:
+                    price, qty = level
+                except (TypeError, ValueError):
+                    continue
+            try:
+                normalized[float(price)] = max(0.0, float(qty))
+            except (TypeError, ValueError):
+                continue
+        return normalized
 
     def update(self, snapshot: OrderBookSnapshot, trades: Sequence[TradeTick] = ()) -> list[LiquidityEvent]:
         events: list[LiquidityEvent] = []
@@ -48,10 +61,7 @@ class LiquidityTracker:
 
     def _book_changes(self, previous: OrderBookSnapshot, current: OrderBookSnapshot) -> list[LiquidityEvent]:
         events: list[LiquidityEvent] = []
-        for side_name, old_levels, new_levels in (
-            ("bid", previous.bids, current.bids),
-            ("ask", previous.asks, current.asks),
-        ):
+        for side_name, old_levels, new_levels in (("bid", previous.bids, current.bids), ("ask", previous.asks, current.asks)):
             old = self._side_map(old_levels)
             new = self._side_map(new_levels)
             for price, old_qty in old.items():
@@ -61,10 +71,7 @@ class LiquidityTracker:
                 change = new_qty - old_qty
                 if abs(change) / old_qty < self.removal_ratio:
                     continue
-                if change > 0:
-                    kind = "stacking"
-                else:
-                    kind = "pulling"
+                kind = "stacking" if change > 0 else "pulling"
                 score = min(10.0, abs(change) / old_qty * 10.0)
                 events.append(LiquidityEvent(kind, side_name, round(score, 2), price, f"qty {old_qty:.6g}->{new_qty:.6g}"))
         return events
