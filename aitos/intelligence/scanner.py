@@ -43,11 +43,25 @@ class OpportunityScanner(AITOSModule):
     @property
     def module_id(self) -> str: return "opportunity-scanner"
     @property
-    def version(self) -> str: return "1.5.1"
+    def version(self) -> str: return "1.6.0"
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
-        await self._exchange.connect(); self._initialized = True
-    async def health_check(self) -> HealthStatus: return HealthStatus(module_id=self.module_id, status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY, latency_ms=0.0, last_event_time=self._last_scan_at, details={"last_candidate_count": self._last_candidate_count, "symbols_tracked": len(self._symbols)})
+        await self._exchange.connect()
+        # Prefer explicit configuration, but automatically populate missing
+        # footprint tick sizes from Binance exchange metadata. This keeps
+        # price-level bucketing aligned with the exchange's PRICE_FILTER.
+        missing = [s for s in self._symbols if s not in self._footprint_tick_sizes]
+        if missing:
+            try:
+                filters = await self._exchange.fetch_exchange_info(missing)
+                for symbol, symbol_filter in filters.items():
+                    if symbol_filter.tick_size > 0:
+                        self._footprint_tick_sizes[symbol] = symbol_filter.tick_size
+                logger.info("loaded footprint tick sizes", extra={"aitos_extra": {"symbols": list(filters), "missing": [s for s in missing if s not in self._footprint_tick_sizes]}})
+            except Exception as exc:
+                logger.warning("could not auto-load footprint tick sizes; footprint remains neutral for missing symbols", extra={"aitos_extra": {"error": str(exc), "symbols": missing}})
+        self._initialized = True
+    async def health_check(self) -> HealthStatus: return HealthStatus(module_id=self.module_id, status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY, latency_ms=0.0, last_event_time=self._last_scan_at, details={"last_candidate_count": self._last_candidate_count, "symbols_tracked": len(self._symbols), "footprint_tick_sizes_loaded": len(self._footprint_tick_sizes)})
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None: await self._exchange.close()
     async def emit_events(self) -> AsyncIterator[Event]:
         return
@@ -73,7 +87,7 @@ class OpportunityScanner(AITOSModule):
             elif interaction.direction == direction.value: interaction_score = 5.0 + interaction.score * 0.5
             else: interaction_score = max(0.0, 5.0 - interaction.score * 0.5)
             interaction_score = round(min(10.0, max(0.0, interaction_score)), 2)
-            interaction_rationale = f"footprint={footprint_signals.bias}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}"
+            interaction_rationale = f"footprint={footprint_signals.bias}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}, tick_size={tick_size:g}"
         else:
             interaction_score = 5.0
             interaction_rationale = "footprint=not_configured; interaction=neutral"
