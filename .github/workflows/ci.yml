@@ -119,6 +119,46 @@ jobs:
           TESTING=true
           EOF
 
+      - name: Diagnose decision_fusion import path
+        env:
+          PYTHONPATH: .
+        run: |
+          set -euxo pipefail
+          python --version
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+          import hashlib
+          import importlib.util
+          import sys
+
+          path = Path("aitos/kernel/decision_fusion.py").resolve()
+          data = path.read_bytes()
+          source = data.decode("utf-8")
+
+          print("PYTHON:", sys.executable)
+          print("PATH:", path)
+          print("BYTES:", len(data))
+          print("SHA256:", hashlib.sha256(data).hexdigest())
+          print("LINE_COUNT:", len(source.splitlines()))
+          print("LINE_134:", repr(source.splitlines()[133] if len(source.splitlines()) > 133 else "<missing>"))
+          print("SOURCE_125_145:")
+          for number, line in enumerate(source.splitlines()[124:145], start=125):
+              print(f"{number}: {line!r}")
+
+          ast.parse(source, filename=str(path))
+          print("AST_PARSE: OK")
+
+          spec = importlib.util.spec_from_file_location("decision_fusion_direct", path)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not construct import spec")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          print("DIRECT_IMPORT: OK")
+          print("MODULE_FILE:", getattr(module, "__file__", None))
+          print("ENGINE:", module.DecisionFusionEngine)
+          PY
+
       - name: Run tests with pytest
         env:
           PYTHONPATH: .
