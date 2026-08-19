@@ -59,7 +59,7 @@ class FakeExchangeAdapter(ExchangeAdapter):
         yield SAMPLE_TRADE
         await asyncio.sleep(3600)
 
-    async def stream_order_book(self, symbols) -> AsyncIterator[OrderBookSnapshot]:
+    async def stream_order_book(self, symbols, levels=20) -> AsyncIterator[OrderBookSnapshot]:
         yield SAMPLE_BOOK
         await asyncio.sleep(3600)
 
@@ -131,6 +131,6 @@ async def test_backfill_klines_publishes_and_persists_history(event_bus):
     count = await service.backfill_klines("BTCUSDT", "1m", limit=2)
 
     assert count == 2
-    assert len(repository.klines) >= 2  # backfill's 2 + possibly 1 from the live stream
+    assert len(repository.klines) >= 2
 
     await service.shutdown(grace_period_seconds=2.0)
