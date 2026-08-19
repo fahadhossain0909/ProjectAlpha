@@ -1,13 +1,17 @@
-"""Incremental download and canonical-Parquet-aware local-file validation."""
+"""Incremental download with dataset-aware canonical Parquet gating."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 import hashlib
 import json
 import tempfile
 import urllib.request
+
+from .dataset_layout import DatasetLayout
+from .dataset_policy import DatasetGate
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,18 @@ class FileRecord:
     path: str
     size: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class DownloadItem:
+    """A raw source file mapped to one canonical dataset partition."""
+    dataset: str
+    exchange: str
+    market: str
+    symbol: str
+    day: date
+    url: str
+    destination: Path
 
 
 class DownloadManifest:
@@ -49,55 +65,76 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-class CanonicalDataIndex:
-    """Answers whether a requested dataset partition already has Parquet.
+class IncrementalDownloader:
+    """Download only data absent from its own canonical Parquet partition.
 
-    A valid canonical partition is the first download gate: if it exists,
-    the raw archive must not be downloaded even when the raw file/manifest is
-    absent. This keeps disk usage and network traffic bounded.
+    The DatasetGate is the first gate. Therefore an existing trades partition
+    cannot suppress an order-book download, and an existing order-book update
+    partition cannot suppress a snapshot download.
     """
 
-    def __init__(self, parquet_root: str | Path):
-        self.root = Path(parquet_root)
-
-    def partition_path(self, key: str) -> Path:
-        parts = key.strip("/").split("/")
-        if len(parts) != 4:
-            raise ValueError("partition key must be exchange/market/symbol/YYYY-MM-DD")
-        exchange, market, symbol, day = parts
-        return (
-            self.root
-            / f"exchange={exchange}"
-            / f"market={market}"
-            / f"symbol={symbol}"
-            / f"date={day}"
-        )
-
-    def has_partition(self, key: str) -> bool:
-        directory = self.partition_path(key)
-        return any(directory.glob("part-*.parquet"))
-
-
-class IncrementalDownloader:
-    """Download only data absent from both canonical Parquet and raw storage."""
-
-    def __init__(self, manifest: DownloadManifest, parquet_index: CanonicalDataIndex | None = None):
+    def __init__(self, manifest: DownloadManifest, parquet_root: str | Path):
         self.manifest = manifest
-        self.parquet_index = parquet_index
+        self.gate = DatasetGate(DatasetLayout(Path(parquet_root)))
+
+    @staticmethod
+    def _manifest_key(item: DownloadItem) -> str:
+        return f"{item.dataset}/{item.exchange}/{item.market}/{item.symbol.upper()}/{item.day.isoformat()}"
+
+    def download_items(self, items: Iterable[DownloadItem], overwrite: bool = False) -> list[Path]:
+        downloaded: list[Path] = []
+        for item in items:
+            key = self._manifest_key(item)
+
+            # DatasetGate is deliberately checked before manifest/raw storage.
+            if not overwrite and not self.gate.should_download_raw(
+                item.dataset, item.exchange, item.market, item.symbol, item.day
+            ):
+                continue
+            if not overwrite and self.manifest.valid(key, item.destination):
+                continue
+
+            item.destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=item.destination.parent, delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                urllib.request.urlretrieve(item.url, tmp_path)
+                digest = sha256_file(tmp_path)
+                size = tmp_path.stat().st_size
+                tmp_path.replace(item.destination)
+                self.manifest.records[key] = {
+                    "dataset": item.dataset,
+                    "exchange": item.exchange,
+                    "market": item.market,
+                    "symbol": item.symbol.upper(),
+                    "date": item.day.isoformat(),
+                    "url": item.url,
+                    "path": str(item.destination),
+                    "size": size,
+                    "sha256": digest,
+                }
+                self.manifest.save()
+                downloaded.append(item.destination)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+        return downloaded
 
     def download(
         self,
         items: Iterable[tuple[str, str, Path]],
         overwrite: bool = False,
     ) -> list[Path]:
+        """Backward-compatible raw download API.
+
+        Legacy callers still use ``key/url/destination``. Dataset-aware callers
+        should prefer ``download_items`` so the DatasetGate can distinguish
+        trades, snapshots and updates.
+        """
         downloaded: list[Path] = []
         for key, url, destination in items:
-            # Canonical Parquet takes precedence over the raw download manifest.
-            if not overwrite and self.parquet_index and self.parquet_index.has_partition(key):
-                continue
             if not overwrite and self.manifest.valid(key, destination):
                 continue
-
             destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -106,12 +143,7 @@ class IncrementalDownloader:
                 digest = sha256_file(tmp_path)
                 size = tmp_path.stat().st_size
                 tmp_path.replace(destination)
-                self.manifest.records[key] = {
-                    "url": url,
-                    "path": str(destination),
-                    "size": size,
-                    "sha256": digest,
-                }
+                self.manifest.records[key] = {"url": url, "path": str(destination), "size": size, "sha256": digest}
                 self.manifest.save()
                 downloaded.append(destination)
             finally:
