@@ -105,10 +105,16 @@ def calculate_position_size(
     position_size_usd = units * entry_price
 
     leverage = calculate_adaptive_leverage(volatility_percentile, risk_score, risk_limits, base_leverage)
+    max_notional_usd = equity_usd * leverage
+    capped_by_leverage = position_size_usd > max_notional_usd
+    if capped_by_leverage:
+        position_size_usd = max_notional_usd
 
+    cap_note = f", leverage_notional_cap={max_notional_usd:.2f}" if capped_by_leverage else ""
     rationale = (
         f"risk={risk_pct:.3f}% of equity (vol_factor={vol_factor:.2f}, corr_factor={corr_factor:.2f}"
-        f"{kelly_note}), leverage={leverage}x (volatility_percentile={volatility_percentile}, risk_score={risk_score})"
+        f"{kelly_note}), leverage={leverage}x{cap_note} "
+        f"(volatility_percentile={volatility_percentile}, risk_score={risk_score})"
     )
     return PositionSizeResult(
         position_size_usd=round(position_size_usd, 2),
