@@ -55,11 +55,37 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
 
+      - name: Verify decision_fusion.py immediately after checkout
+        run: |
+          set -euxo pipefail
+          echo '=== GIT STATE AFTER CHECKOUT ==='
+          git rev-parse HEAD
+          git status --short
+          echo '=== decision_fusion.py hashes ==='
+          sha256sum aitos/kernel/decision_fusion.py
+          git hash-object aitos/kernel/decision_fusion.py
+          git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
+          echo '=== Python syntax check ==='
+          python3 -m py_compile aitos/kernel/decision_fusion.py
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
+
+      - name: Verify decision_fusion.py after setup-python cache restore
+        run: |
+          set -euxo pipefail
+          echo '=== GIT STATE AFTER SETUP-PYTHON ==='
+          git rev-parse HEAD
+          git status --short
+          echo '=== decision_fusion.py hashes ==='
+          sha256sum aitos/kernel/decision_fusion.py
+          git hash-object aitos/kernel/decision_fusion.py
+          git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
+          echo '=== Python syntax check ==='
+          python -m py_compile aitos/kernel/decision_fusion.py
 
       - name: Install dependencies
         run: |
@@ -67,6 +93,21 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           pip install pytest pytest-cov
+
+      - name: Verify decision_fusion.py before pytest
+        run: |
+          set -euxo pipefail
+          echo '=== GIT STATE BEFORE PYTEST ==='
+          git rev-parse HEAD
+          git status --short
+          echo '=== decision_fusion.py hashes ==='
+          sha256sum aitos/kernel/decision_fusion.py
+          git hash-object aitos/kernel/decision_fusion.py
+          git show HEAD:aitos/kernel/decision_fusion.py | sha256sum
+          echo '=== Relevant source ==='
+          nl -ba aitos/kernel/decision_fusion.py | sed -n '115,150p'
+          echo '=== Python syntax check ==='
+          python -m py_compile aitos/kernel/decision_fusion.py
 
       - name: Create .env file from secrets for tests
         run: |
