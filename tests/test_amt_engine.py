@@ -34,11 +34,18 @@ def test_amt_engine_returns_structured_context():
 
 def test_initial_balance_and_extensions_are_session_aware():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    ticks = trades([100, 102, 101, 105, 107, 106], [1, 1, 1, 1, 1, 1], start=start)
-    # First three ticks form the 60-minute IB; later ticks extend above it.
-    ticks[-3].timestamp = start + timedelta(minutes=30)
-    ticks[-2].timestamp = start + timedelta(minutes=90)
-    ticks[-1].timestamp = start + timedelta(minutes=91)
+    timestamps = [
+        start,
+        start + timedelta(minutes=30),
+        start + timedelta(minutes=45),
+        start + timedelta(minutes=90),
+        start + timedelta(minutes=91),
+        start + timedelta(minutes=92),
+    ]
+    ticks = [
+        TradeTick("BTCUSDT", i, price, 1.0, TradeSide.BUY, False, ts)
+        for i, (price, ts) in enumerate(zip([100, 102, 101, 105, 107, 106], timestamps))
+    ]
     context = AMTEngine(1.0, ib_minutes=60).analyze(ticks, session_start=start)
     assert context.ib_high == 102.0
     assert context.ib_low == 100.0
