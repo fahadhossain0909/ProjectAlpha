@@ -1,3 +1,4 @@
 # Optional dependencies for historical backtesting
 pyarrow>=15,<23
 pytest>=8,<9
+pytest-asyncio>=0.23,<2
