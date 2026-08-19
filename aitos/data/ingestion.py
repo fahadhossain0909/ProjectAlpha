@@ -29,6 +29,7 @@ class DataIngestionService(AITOSModule):
         self._initialized = False; self._tasks: List[asyncio.Task] = []; self._last_event_time: Optional[str] = None
         self._ticks_processed = 0; self._liquidity_events = 0; self._orderflow_events = 0; self._errors = 0
         self._live_state = LiveMarketStateStore(max_trades=max(5000, self._liquidity_trade_window))
+        self._recent_trades = self._live_state.trades
     @property
     def module_id(self) -> str: return "data-ingestion-service"
     @property
@@ -69,7 +70,7 @@ class DataIngestionService(AITOSModule):
         except asyncio.CancelledError: return
         except Exception as exc: self._errors += 1; logger.error("order book stream loop crashed: %s", exc)
     async def _handle_kline(self, kline: Kline) -> None:
-        await self._event_bus.publish(Event(topic=kline_topic(kline.symbol, kline.timeframe), payload=kline.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL));
+        await self._event_bus.publish(Event(topic=kline_topic(kline.symbol, kline.timeframe), payload=kline.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL))
         if self._repository is not None: await self._repository.save_kline(kline)
         self._tick_processed()
     async def _handle_trade(self, trade: TradeTick) -> None:
