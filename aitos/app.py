@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol
 
-from aitos.core.contracts import AITOSModule
+from aitos.core.contracts import AITOSModule, HealthStatus
 from aitos.data.ingestion import DataIngestionService
 from aitos.data.repository import MarketDataRepository
 from aitos.eventbus.redis_bus import EventBus, Subscription
@@ -52,6 +53,7 @@ class SystemComponents:
     knowledge_graph: Optional[KnowledgeGraphWriter] = None
     correlation_updater: Optional[SymbolCorrelationUpdater] = None
     _price_feed_subscriptions: List[Subscription] = field(default_factory=list)
+
     def all_modules(self) -> List[AITOSModule]:
         modules: List[AITOSModule] = [self.event_bus, self.kernel, self.risk_engine, self.journal, self.rl_feedback, self.ml_feedback, self.attention_feedback]
         if self.knowledge_graph is not None: modules.append(self.knowledge_graph)
@@ -86,6 +88,18 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
         ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
         reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
+async def _module_health(module: AITOSModule) -> HealthStatus:
+    """Resolve both contract-compliant coroutines and legacy async-generator checks."""
+    result = module.health_check()
+    if inspect.isawaitable(result):
+        return await result
+    if inspect.isasyncgen(result):
+        try:
+            return await anext(result)
+        except StopAsyncIteration as exc:
+            raise RuntimeError(f"{module.module_id}.health_check() produced no HealthStatus") from exc
+    raise TypeError(f"{module.module_id}.health_check() returned unsupported type {type(result).__name__}")
+
 async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) -> None:
     import asyncio, time
     for module in components.all_modules(): await module.initialize({})
@@ -94,7 +108,8 @@ async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) 
         await components.event_bus.subscribe("market.trade.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices")]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if all((await m.health_check()).status.value in ("healthy", "degraded") for m in components.all_modules()): return
+        health_states = [await _module_health(module) for module in components.all_modules()]
+        if all(status.status.value in ("healthy", "degraded") for status in health_states): return
         await asyncio.sleep(0.05)
     raise RuntimeError(f"Some modules failed to initialize within {timeout}s timeout")
 
