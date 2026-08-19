@@ -35,7 +35,7 @@ class LiquidityTracker:
 
     @staticmethod
     def _side_map(levels: Sequence[tuple[float, float]]) -> dict[float, float]:
-        return {price: max(0.0, qty) for price, qty in levels}
+        return {float(price): max(0.0, float(qty)) for price, qty in levels}
 
     def update(self, snapshot: OrderBookSnapshot, trades: Sequence[TradeTick] = ()) -> list[LiquidityEvent]:
         events: list[LiquidityEvent] = []
@@ -61,10 +61,7 @@ class LiquidityTracker:
                 change = new_qty - old_qty
                 if abs(change) / old_qty < self.removal_ratio:
                     continue
-                if change > 0:
-                    kind = "stacking"
-                else:
-                    kind = "pulling"
+                kind = "stacking" if change > 0 else "pulling"
                 score = min(10.0, abs(change) / old_qty * 10.0)
                 events.append(LiquidityEvent(kind, side_name, round(score, 2), price, f"qty {old_qty:.6g}->{new_qty:.6g}"))
         return events
@@ -73,12 +70,12 @@ class LiquidityTracker:
         if not trades:
             return []
         events: list[LiquidityEvent] = []
-        prev_bid_qty = sum(q for _, q in previous.bids)
-        prev_ask_qty = sum(q for _, q in previous.asks)
-        curr_bid_qty = sum(q for _, q in current.bids)
-        curr_ask_qty = sum(q for _, q in current.asks)
-        buy_qty = sum(t.quantity for t in trades if not t.is_buyer_maker and t.side == TradeSide.BUY)
-        sell_qty = sum(t.quantity for t in trades if t.is_buyer_maker or t.side == TradeSide.SELL)
+        prev_bid_qty = sum(float(q) for _, q in previous.bids)
+        prev_ask_qty = sum(float(q) for _, q in previous.asks)
+        curr_bid_qty = sum(float(q) for _, q in current.bids)
+        curr_ask_qty = sum(float(q) for _, q in current.asks)
+        buy_qty = sum(float(t.quantity) for t in trades if not t.is_buyer_maker and t.side == TradeSide.BUY)
+        sell_qty = sum(float(t.quantity) for t in trades if t.is_buyer_maker or t.side == TradeSide.SELL)
         if prev_ask_qty > 0 and curr_ask_qty / prev_ask_qty < 1.0 - self.removal_ratio and buy_qty > 0:
             score = min(10.0, (1.0 - curr_ask_qty / prev_ask_qty) * 10.0 + min(5.0, buy_qty / max(prev_ask_qty, 1e-12) * 5.0))
             events.append(LiquidityEvent("sweep", "ask", round(score, 2), current.best_ask, "ask liquidity removed with aggressive buying"))
