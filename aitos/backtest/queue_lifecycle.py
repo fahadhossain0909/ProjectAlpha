@@ -29,7 +29,7 @@ class LifecycleFill:
     maker: bool = True
 
 class QueueOrderLifecycle:
-    """Conservative passive-order lifecycle with queue aging and expiry."""
+    """Conservative passive-order lifecycle with book-change queue aging."""
     def __init__(self) -> None:
         self.orders: dict[str, SimulatedOrder] = {}
 
@@ -51,7 +51,6 @@ class QueueOrderLifecycle:
         return True
 
     def age(self, timestamp: datetime) -> list[str]:
-        """Expire orders whose TTL elapsed; queue priority otherwise remains FIFO."""
         expired: list[str] = []
         for order in self.orders.values():
             if order.status not in {"open", "partial"} or order.ttl is None:
@@ -62,15 +61,31 @@ class QueueOrderLifecycle:
                 expired.append(order.order_id)
         return expired
 
-    def update_queue(self, order_id: str, queue_ahead_reduction: float, timestamp: datetime) -> bool:
-        order = self.orders.get(order_id)
-        if order is None or order.status not in {"open", "partial"}:
-            return False
-        if queue_ahead_reduction < 0:
-            raise ValueError("queue_ahead_reduction must be non-negative")
-        order.queue_ahead = max(0.0, order.queue_ahead - queue_ahead_reduction)
-        order.last_queue_update = timestamp
-        return True
+    def on_book_change(self, side: Side, price: float, old_qty: float, new_qty: float, timestamp: datetime) -> list[str]:
+        """Apply displayed-volume reductions conservatively to queue ahead.
+
+        Reductions are assigned to the earliest resting orders first. Increases
+        never improve our queue position, preventing optimistic fills.
+        """
+        if old_qty < 0 or new_qty < 0:
+            raise ValueError("book quantities must be non-negative")
+        self.age(timestamp)
+        reduction = max(0.0, old_qty - new_qty)
+        updated: list[str] = []
+        if reduction <= 0:
+            return updated
+        candidates = [o for o in self.orders.values() if o.status in {"open", "partial"} and o.side == side and o.price == price]
+        candidates.sort(key=lambda o: (o.created_at, o.order_id))
+        for order in candidates:
+            if reduction <= 0:
+                break
+            consumed = min(order.queue_ahead, reduction)
+            if consumed > 0:
+                order.queue_ahead -= consumed
+                order.last_queue_update = timestamp
+                reduction -= consumed
+                updated.append(order.order_id)
+        return updated
 
     def consume(self, side: Side, price: float, traded_qty: float, timestamp: datetime) -> list[LifecycleFill]:
         if traded_qty <= 0:
