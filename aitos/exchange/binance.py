@@ -22,6 +22,7 @@ DEFAULT_RATE_LIMIT_CAPACITY = 2000
 DEFAULT_RATE_LIMIT_REFILL_PER_SECOND = 2000 / 60
 MAX_BACKOFF_SECONDS = 60.0
 INITIAL_BACKOFF_SECONDS = 1.0
+ORDERBOOK_BOOTSTRAP_QUEUE_SIZE = 5000
 
 
 class BinanceFuturesAdapter(ExchangeAdapter):
@@ -82,32 +83,76 @@ class BinanceFuturesAdapter(ExchangeAdapter):
             yield trade
 
     async def stream_order_book(self, symbols: List[str], levels: int = 20) -> AsyncIterator[OrderBookSnapshot]:
-        """Reconstruct a local L2 book from Binance diff-depth updates.
+        """Reconstruct a local L2 book with loss-aware Binance bootstrap.
 
-        Each symbol is seeded from REST and then advanced only when update-id
-        continuity is valid. A gap/chain break triggers a REST resync; the
-        current diff is discarded and the next bridging event is accepted.
+        The WebSocket producer starts before REST snapshots are requested, so
+        depth updates cannot be silently lost during the snapshot round trip.
+        Buffered updates are replayed after each snapshot is seeded. Binance
+        U/u/pu continuity is enforced by LocalOrderBook; a gap causes a fresh
+        snapshot bootstrap rather than applying an unsafe update.
         """
+        if not symbols:
+            return
+
         streams = [f"{s.lower()}@depth@100ms" for s in symbols]
         symbol_by_stream = {f"{s.lower()}@depth@100ms": s for s in symbols}
-        books: Dict[str, LocalOrderBook] = {}
-        for symbol in symbols:
-            book = LocalOrderBook(symbol, max_levels=max(100, levels * 5))
-            book.seed(await self.fetch_order_book(symbol, limit=max(100, levels)))
-            books[symbol] = book
+        queue: asyncio.Queue[tuple[Any, str]] = asyncio.Queue(maxsize=ORDERBOOK_BOOTSTRAP_QUEUE_SIZE)
+        producer_done = asyncio.Event()
 
-        async for data, stream_name in self._raw_stream(streams):
-            symbol = symbol_by_stream.get(stream_name)
-            if symbol is None:
-                continue
+        async def producer() -> None:
             try:
-                update = parse_depth_diff_ws(data)
-                snapshot = books[symbol].apply(update)
-            except OrderBookSequenceError as exc:
-                logger.warning("order-book sequence break; resyncing", extra={"aitos_extra": {"symbol": symbol, "error": str(exc)}})
-                books[symbol].seed(await self.fetch_order_book(symbol, limit=max(100, levels)))
-                continue
-            yield snapshot
+                async for data, stream_name in self._raw_stream(streams):
+                    try:
+                        queue.put_nowait((data, stream_name))
+                    except asyncio.QueueFull:
+                        logger.error("order-book bootstrap buffer overflow; forcing resync", extra={"aitos_extra": {"streams": streams}})
+                        # Dropping old depth events is unsafe. Clear the queue so
+                        # consumers will force a REST resync at the next gap.
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        queue.put_nowait((data, stream_name))
+            except asyncio.CancelledError:
+                raise
+            finally:
+                producer_done.set()
+
+        producer_task = asyncio.create_task(producer(), name="binance-orderbook-producer")
+        books: Dict[str, LocalOrderBook] = {}
+        try:
+            snapshot_tasks = {
+                symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-snapshot-{symbol}")
+                for symbol in symbols
+            }
+            for symbol, task in snapshot_tasks.items():
+                book = LocalOrderBook(symbol, max_levels=max(100, levels * 5))
+                book.seed(await task)
+                books[symbol] = book
+
+            while True:
+                if producer_done.is_set() and queue.empty():
+                    break
+                try:
+                    data, stream_name = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                symbol = symbol_by_stream.get(stream_name)
+                if symbol is None:
+                    continue
+                try:
+                    update = parse_depth_diff_ws(data)
+                    snapshot = books[symbol].apply(update)
+                except OrderBookSequenceError as exc:
+                    logger.warning("order-book sequence break; resyncing", extra={"aitos_extra": {"symbol": symbol, "error": str(exc)}})
+                    books[symbol].reset()
+                    books[symbol].seed(await self.fetch_order_book(symbol, limit=max(100, levels)))
+                    continue
+                yield snapshot
+        finally:
+            producer_task.cancel()
+            await asyncio.gather(producer_task, return_exceptions=True)
 
     async def _get(self, path: str, params: dict, weight: int) -> Any:
         if self._session is None:
