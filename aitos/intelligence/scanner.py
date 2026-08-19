@@ -11,6 +11,10 @@ from aitos.intelligence import indicators
 from aitos.intelligence.auction import auction_context_score
 from aitos.intelligence.funding import funding_rate_score
 from aitos.intelligence.liquidity import liquidity_intelligence_score
+from aitos.intelligence.liquidity_tracker import LiquidityTracker
+from aitos.intelligence.footprint import FootprintEngine
+from aitos.intelligence.footprint_signals import FootprintSignalEngine
+from aitos.intelligence.orderflow_liquidity_interaction import FlowLiquidityInteractionEngine
 from aitos.intelligence.open_interest import oi_trend_score
 from aitos.intelligence.order_flow_engine import OrderFlowEngine
 from aitos.intelligence.rl_policy import NeutralRLScorer, RLPolicyScorer
@@ -19,7 +23,7 @@ from aitos.models.market import OpenInterest
 from aitos.models.trade import Opportunity, TradeSide
 logger = get_logger("aitos.intelligence.scanner")
 TOPIC_SCAN_COMPLETE = "market.opportunity_scanned"
-DEFAULT_WEIGHTS: Dict[str, float] = {"trend_strength": 0.15, "liquidity_quality": 0.10, "order_flow_bias": 0.15, "auction_context": 0.10, "volatility": 0.05, "market_regime": 0.10, "lead_lag": 0.10, "funding_rate": 0.10, "open_interest_trend": 0.10, "rl_confidence": 0.05}
+DEFAULT_WEIGHTS: Dict[str, float] = {"trend_strength": 0.10, "liquidity_quality": 0.10, "order_flow_bias": 0.15, "auction_context": 0.10, "volatility": 0.05, "market_regime": 0.10, "lead_lag": 0.10, "funding_rate": 0.08, "open_interest_trend": 0.08, "rl_confidence": 0.04, "footprint_interaction": 0.10}
 REGIME_FIT_SCORE = {"trending": 9.0, "ranging": 4.0, "volatile": 3.0, "unknown": 5.0}
 def _utc_now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 @dataclass(frozen=True)
@@ -34,12 +38,12 @@ def determine_direction(structure_direction: str, cvd_score: float) -> Optional[
         if cvd_score <= 3.5: return TradeSide.SHORT
     return None
 class OpportunityScanner(AITOSModule):
-    def __init__(self, event_bus: EventBus, exchange: ExchangeAdapter, symbols: List[str], timeframe: str = "15m", reference_symbol: str = "BTCUSDT", rl_scorer: Optional[RLPolicyScorer] = None, weights: Optional[Dict[str, float]] = None, min_score_threshold: float = 60.0, top_n: int = 5, kline_lookback: int = 100, trade_lookback: int = 500) -> None:
-        self._event_bus, self._exchange, self._symbols = event_bus, exchange, symbols; self._timeframe, self._reference_symbol = timeframe, reference_symbol; self._rl_scorer = rl_scorer or NeutralRLScorer(); self._weights = weights or DEFAULT_WEIGHTS; self._min_score_threshold, self._top_n = min_score_threshold, top_n; self._kline_lookback, self._trade_lookback = kline_lookback, trade_lookback; self._initialized = False; self._last_oi: Dict[str, OpenInterest] = {}; self._last_scan_at: Optional[str] = None; self._last_candidate_count = 0
+    def __init__(self, event_bus: EventBus, exchange: ExchangeAdapter, symbols: List[str], timeframe: str = "15m", reference_symbol: str = "BTCUSDT", rl_scorer: Optional[RLPolicyScorer] = None, weights: Optional[Dict[str, float]] = None, min_score_threshold: float = 60.0, top_n: int = 5, kline_lookback: int = 100, trade_lookback: int = 500, footprint_tick_sizes: Optional[Dict[str, float]] = None) -> None:
+        self._event_bus, self._exchange, self._symbols = event_bus, exchange, symbols; self._timeframe, self._reference_symbol = timeframe, reference_symbol; self._rl_scorer = rl_scorer or NeutralRLScorer(); self._weights = weights or DEFAULT_WEIGHTS; self._min_score_threshold, self._top_n = min_score_threshold, top_n; self._kline_lookback, self._trade_lookback = kline_lookback, trade_lookback; self._footprint_tick_sizes = footprint_tick_sizes or {}; self._initialized = False; self._last_oi: Dict[str, OpenInterest] = {}; self._last_scan_at: Optional[str] = None; self._last_candidate_count = 0; self._liquidity_trackers: Dict[str, LiquidityTracker] = {}; self._footprint_engines: Dict[str, FootprintEngine] = {}; self._footprint_signal_engine = FootprintSignalEngine(); self._interaction_engine = FlowLiquidityInteractionEngine()
     @property
     def module_id(self) -> str: return "opportunity-scanner"
     @property
-    def version(self) -> str: return "1.4.0"
+    def version(self) -> str: return "1.5.0"
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
         await self._exchange.connect(); self._initialized = True
@@ -49,6 +53,11 @@ class OpportunityScanner(AITOSModule):
         return
         yield
     async def handle_event(self, event: Event) -> Optional[EventResponse]: return None
+    def _footprint_tick_size(self, symbol: str) -> float:
+        tick = self._footprint_tick_sizes.get(symbol)
+        if tick is None or tick <= 0:
+            raise ValueError(f"missing valid footprint tick size for {symbol}; configure footprint_tick_sizes from exchange PRICE_FILTER")
+        return tick
     async def scan_symbol(self, symbol: str, reference_klines: Optional[list] = None) -> Optional[ScanCandidate]:
         self._require_initialized(); klines = await self._exchange.fetch_klines(symbol, self._timeframe, limit=self._kline_lookback)
         if len(klines) < 20: return None
@@ -58,9 +67,16 @@ class OpportunityScanner(AITOSModule):
         candle_cvd = indicators.cvd_trend_score(klines); flow_score = flow_features.bias_score if flow_features else candle_cvd; direction = determine_direction(structure_direction, flow_score); self._last_oi[symbol] = oi_current
         if direction is None: return None
         trend_score = min(10.0, indicators.adx(klines) / 10.0); volatility_score = _volatility_fitness(vol_percentile); regime_score = REGIME_FIT_SCORE.get(regime, 5.0); liquidity_score = liquidity_intelligence_score(order_book, trades); lead_lag = indicators.lead_lag_score(klines, reference_klines) if reference_klines and symbol != self._reference_symbol else 5.0; funding_score = funding_rate_score(funding, direction); price_moved_up = klines[-1].close > klines[0].close; oi_score = oi_trend_score(oi_current, oi_previous, direction, price_moved_up); auction_score = auction_context_score(klines, direction.value)
-        rl_context = {"regime": regime, "direction": direction.value, "trend_strength": trend_score, "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score}; rl_score = await self._rl_scorer.score(symbol, rl_context)
-        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2)}; composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) * 10; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}")
+        tracker = self._liquidity_trackers.setdefault(symbol, LiquidityTracker()); liquidity_events = tracker.update(order_book, trades)
+        footprint_engine = self._footprint_engines.setdefault(symbol, FootprintEngine(self._footprint_tick_size(symbol))); footprint = footprint_engine.build(trades); footprint_signals = self._footprint_signal_engine.evaluate(footprint); interaction = self._interaction_engine.evaluate(footprint_signals, liquidity_events)
+        if interaction.direction == "neutral": interaction_score = 5.0
+        elif interaction.direction == direction.value: interaction_score = 5.0 + interaction.score * 0.5
+        else: interaction_score = max(0.0, 5.0 - interaction.score * 0.5)
+        interaction_score = round(min(10.0, max(0.0, interaction_score)), 2)
+        rl_context = {"regime": regime, "direction": direction.value, "trend_strength": trend_score, "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "footprint_interaction": interaction_score}; rl_score = await self._rl_scorer.score(symbol, rl_context)
+        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2), "footprint_interaction": interaction_score}; weight_total = sum(self._weights.get(k, 0.0) for k in component_scores); composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) / weight_total * 10 if weight_total else 0.0; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}")
         if flow_features: rationale.append(f"orderflow delta={flow_features.delta:.4f}, cvd={flow_features.cvd:.4f}, buy_ratio={flow_features.buy_ratio:.3f}, aggression={flow_features.aggression:.3f}, vwap={flow_features.vwap:.4f}")
+        rationale.append(f"footprint={footprint_signals.bias if footprint_signals else 'neutral'}, interaction={interaction.kind}, interaction_score={interaction_score:.1f}")
         rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
         return ScanCandidate(symbol=symbol, direction=direction, composite_score=round(composite, 2), component_scores=component_scores, rationale=rationale, entry_price=klines[-1].close, atr=atr, regime=regime)
     async def scan_all(self) -> List[ScanCandidate]:
