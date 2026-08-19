@@ -253,3 +253,17 @@ async def test_handle_event_auto_updates_matching_open_trade(event_bus, risk_eng
 
     assert trade.trade_id not in [t.trade_id for t in lifecycle.get_open_trades()]
     assert trade.trade_id in [t.trade_id for t in lifecycle.get_closed_trades()]
+
+@pytest.mark.asyncio
+async def test_projected_hard_limit_rejects_oversized_candidate_before_order(event_bus, risk_engine):
+    lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
+    await lifecycle.initialize({})
+
+    opportunity = make_opportunity(symbol="BNBUSDT", entry_price=100.0, stop_loss_price=99.99)
+    portfolio = make_portfolio(equity_usd=1_000.0, peak_equity_usd=1_000.0, volatility_percentile=0.0, max_pairwise_correlation=0.0)
+
+    trade = await lifecycle.submit_opportunity(opportunity, portfolio)
+
+    assert trade.state == TradeLifecycleState.REJECTED
+    assert "projected hard limit breach" in trade.rejection_reason
+    assert lifecycle.get_open_trades() == []

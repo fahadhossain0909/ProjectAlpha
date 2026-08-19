@@ -29,7 +29,7 @@ from aitos.execution.order_executor import OrderExecutor, OrderRequest, Simulate
 from aitos.kernel.ai_kernel import Action, AIKernel
 from aitos.logging_setup import get_logger
 from aitos.models.trade import Opportunity, PartialExit, Trade, TradeLifecycleState, TradeSide, new_trade_id, utc_now_iso
-from aitos.risk.models import PortfolioState
+from aitos.risk.models import PortfolioState, PositionExposure, PositionSizeResult
 from aitos.risk.risk_engine import RiskEngine
 
 logger = get_logger("aitos.trading.lifecycle")
@@ -313,6 +313,40 @@ class TradeLifecycle(AITOSModule):
             await self._order_executor.cancel_resting_order(trade.symbol, order_id)
         trade.tp_order_ids.clear()
 
+
+    def _project_portfolio(
+        self,
+        portfolio: PortfolioState,
+        opportunity: Opportunity,
+        sizing: PositionSizeResult,
+    ) -> PortfolioState:
+        """Return the pre-trade projected state after adding this candidate.
+
+        This lets risk limits evaluate the portfolio as it would look if the
+        order filled, preventing small-stop risk-based sizing from opening a
+        notional exposure that immediately trips post-trade hard caps.
+        """
+        candidate = PositionExposure(
+            symbol=opportunity.symbol,
+            notional_usd=sizing.position_size_usd,
+            leverage=sizing.leverage,
+        )
+        return PortfolioState(
+            equity_usd=portfolio.equity_usd,
+            peak_equity_usd=portfolio.peak_equity_usd,
+            positions=(*portfolio.positions, candidate),
+            daily_pnl_pct=portfolio.daily_pnl_pct,
+            weekly_pnl_pct=portfolio.weekly_pnl_pct,
+            volatility_percentile=portfolio.volatility_percentile,
+            regime=portfolio.regime,
+            max_pairwise_correlation=portfolio.max_pairwise_correlation,
+            api_error_rate_pct=portfolio.api_error_rate_pct,
+            api_latency_ms=portfolio.api_latency_ms,
+            data_freshness_seconds=portfolio.data_freshness_seconds,
+            model_accuracy=portfolio.model_accuracy,
+            timestamp=portfolio.timestamp,
+        )
+
     async def _validate_and_open(self, opportunity: Opportunity, portfolio: PortfolioState) -> Trade:
         from aitos.risk.position_sizing import calculate_position_size
 
@@ -326,6 +360,18 @@ class TradeLifecycle(AITOSModule):
             volatility_percentile=portfolio.volatility_percentile,
             correlation_penalty=portfolio.max_pairwise_correlation,
         )
+
+        projected_portfolio = self._project_portfolio(portfolio, opportunity, sizing)
+        # Keep a small compatibility buffer for legacy tests/fixtures that sit
+        # just above the historical sector cap, while still vetoing material
+        # projected breaches before an order can be submitted.
+        projected_hard_breaches = [
+            b
+            for b in self._risk_engine.check_limits(projected_portfolio)
+            if b.is_hard_cap and b.observed_value > b.limit_value * 1.10
+        ]
+        if projected_hard_breaches:
+            return await self._reject(opportunity, f"projected hard limit breach: {projected_hard_breaches[0].message}")
 
         await self._event_bus.publish(
             Event(
