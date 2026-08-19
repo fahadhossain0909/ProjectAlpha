@@ -4,9 +4,10 @@ from aitos.intelligence.footprint import FootprintEngine
 from aitos.models.market import TradeSide, TradeTick
 
 
-def trade(price, qty, side, maker=False):
+def trade(price, qty, side, maker=False, trade_id=1):
     return TradeTick(
         symbol="BTCUSDT",
+        trade_id=trade_id,
         price=price,
         quantity=qty,
         timestamp=datetime.now(timezone.utc),
@@ -18,9 +19,9 @@ def trade(price, qty, side, maker=False):
 def test_builds_price_level_bid_ask_volume():
     engine = FootprintEngine(1.0)
     fp = engine.build([
-        trade(100.1, 2.0, TradeSide.BUY),
-        trade(100.2, 1.0, TradeSide.SELL, maker=True),
-        trade(100.7, 3.0, TradeSide.BUY),
+        trade(100.1, 2.0, TradeSide.BUY, trade_id=1),
+        trade(100.2, 1.0, TradeSide.SELL, maker=True, trade_id=2),
+        trade(100.7, 3.0, TradeSide.BUY, trade_id=3),
     ])
     assert fp is not None
     assert len(fp.levels) == 2
