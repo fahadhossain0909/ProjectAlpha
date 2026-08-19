@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Protocol
@@ -86,15 +88,26 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
         ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
         reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
+async def _health_status(module: AITOSModule):
+    """Resolve both coroutine and async-generator health-check contracts."""
+    result = module.health_check()
+    if inspect.isawaitable(result):
+        return await result
+    if inspect.isasyncgen(result):
+        async for status in result:
+            return status
+        raise RuntimeError(f"Module {module.module_id} returned an empty health-check stream")
+    return result
+
 async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) -> None:
-    import asyncio, time
     for module in components.all_modules(): await module.initialize({})
     components._price_feed_subscriptions = [
         await components.event_bus.subscribe("market.kline.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices"),
         await components.event_bus.subscribe("market.trade.*", components.trade_lifecycle.handle_event, group="trade-lifecycle-prices")]
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if all((await m.health_check()).status.value in ("healthy", "degraded") for m in components.all_modules()): return
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        statuses = [await _health_status(module) for module in components.all_modules()]
+        if all(status.status.value in ("healthy", "degraded") for status in statuses): return
         await asyncio.sleep(0.05)
     raise RuntimeError(f"Some modules failed to initialize within {timeout}s timeout")
 
@@ -128,7 +141,7 @@ class PaperPortfolioTracker:
 def _parse_iso(value: str) -> datetime: return datetime.fromisoformat(value)
 
 class LivePortfolioTracker:
-    def __init__(self, order_executor, asset: str = "USDT") -> None:
+    def __init__(self, order_executor, asset: str = "USDT"):
         self._order_executor, self._asset = order_executor, asset; self._peak_equity_usd: Optional[float] = None; self._last_known_equity_usd = 0.0
     async def refresh_equity(self) -> float:
         equity = await self._order_executor.get_account_balance(self._asset); self._last_known_equity_usd = equity
