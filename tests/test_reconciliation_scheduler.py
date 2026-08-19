@@ -17,7 +17,7 @@ def make_portfolio(**overrides):
 
 def make_opportunity(**overrides):
     defaults = dict(
-        symbol="BTCUSDT", side=TradeSide.LONG, entry_price=100.0, stop_loss_price=98.0,
+        symbol="BTCUSDT", side=TradeSide.LONG, entry_price=100.0, stop_loss_price=97.5,
         take_profit_levels=[104.0], confidence=0.8, strategy_id="test-strategy", rationale="test",
         breakeven_at_r_multiple=None,
     )

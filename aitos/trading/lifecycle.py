@@ -362,13 +362,10 @@ class TradeLifecycle(AITOSModule):
         )
 
         projected_portfolio = self._project_portfolio(portfolio, opportunity, sizing)
-        # Keep a small compatibility buffer for legacy tests/fixtures that sit
-        # just above the historical sector cap, while still vetoing material
-        # projected breaches before an order can be submitted.
         projected_hard_breaches = [
             b
             for b in self._risk_engine.check_limits(projected_portfolio)
-            if b.is_hard_cap and b.observed_value > b.limit_value * 1.10
+            if b.is_hard_cap
         ]
         if projected_hard_breaches:
             return await self._reject(opportunity, f"projected hard limit breach: {projected_hard_breaches[0].message}")
