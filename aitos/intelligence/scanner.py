@@ -12,7 +12,7 @@ from aitos.intelligence.auction import auction_context_score
 from aitos.intelligence.funding import funding_rate_score
 from aitos.intelligence.liquidity import liquidity_intelligence_score
 from aitos.intelligence.open_interest import oi_trend_score
-from aitos.intelligence.order_flow import order_flow_bias_score
+from aitos.intelligence.order_flow_engine import OrderFlowEngine
 from aitos.intelligence.rl_policy import NeutralRLScorer, RLPolicyScorer
 from aitos.logging_setup import get_logger
 from aitos.models.market import OpenInterest
@@ -39,7 +39,7 @@ class OpportunityScanner(AITOSModule):
     @property
     def module_id(self) -> str: return "opportunity-scanner"
     @property
-    def version(self) -> str: return "1.3.0"
+    def version(self) -> str: return "1.4.0"
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
         await self._exchange.connect(); self._initialized = True
@@ -53,11 +53,15 @@ class OpportunityScanner(AITOSModule):
         self._require_initialized(); klines = await self._exchange.fetch_klines(symbol, self._timeframe, limit=self._kline_lookback)
         if len(klines) < 20: return None
         order_book = await self._exchange.fetch_order_book(symbol, limit=20); trades = await self._exchange.fetch_recent_trades(symbol, limit=self._trade_lookback); funding = await self._exchange.fetch_funding_rate(symbol); oi_current = await self._exchange.fetch_open_interest(symbol); oi_previous = self._last_oi.get(symbol)
-        atr = indicators.average_true_range(klines); vol_percentile = indicators.atr_percentile(klines); regime = indicators.classify_regime(klines); structure_direction, structure_strength = indicators.detect_structure_break(klines); candle_cvd = indicators.cvd_trend_score(klines); flow_score = order_flow_bias_score(trades) if trades else candle_cvd; direction = determine_direction(structure_direction, flow_score); self._last_oi[symbol] = oi_current
+        atr = indicators.average_true_range(klines); vol_percentile = indicators.atr_percentile(klines); regime = indicators.classify_regime(klines); structure_direction, structure_strength = indicators.detect_structure_break(klines)
+        flow_features = OrderFlowEngine(max_trades=max(100, self._trade_lookback)).ingest_many(trades) if trades else None
+        candle_cvd = indicators.cvd_trend_score(klines); flow_score = flow_features.bias_score if flow_features else candle_cvd; direction = determine_direction(structure_direction, flow_score); self._last_oi[symbol] = oi_current
         if direction is None: return None
         trend_score = min(10.0, indicators.adx(klines) / 10.0); volatility_score = _volatility_fitness(vol_percentile); regime_score = REGIME_FIT_SCORE.get(regime, 5.0); liquidity_score = liquidity_intelligence_score(order_book, trades); lead_lag = indicators.lead_lag_score(klines, reference_klines) if reference_klines and symbol != self._reference_symbol else 5.0; funding_score = funding_rate_score(funding, direction); price_moved_up = klines[-1].close > klines[0].close; oi_score = oi_trend_score(oi_current, oi_previous, direction, price_moved_up); auction_score = auction_context_score(klines, direction.value)
         rl_context = {"regime": regime, "direction": direction.value, "trend_strength": trend_score, "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score}; rl_score = await self._rl_scorer.score(symbol, rl_context)
-        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2)}; composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) * 10; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}"); rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
+        component_scores = {"trend_strength": round(trend_score, 2), "liquidity_quality": liquidity_score, "order_flow_bias": flow_score, "auction_context": auction_score, "volatility": volatility_score, "market_regime": regime_score, "lead_lag": lead_lag, "funding_rate": funding_score, "open_interest_trend": oi_score, "rl_confidence": round(rl_score, 2)}; composite = sum(component_scores[k] * self._weights.get(k, 0.0) for k in component_scores) * 10; rationale = [f"{k.replace('_', ' ')}={v:.1f}/10" for k, v in component_scores.items()]; rationale.append(f"executed_trades={len(trades)}, candle_cvd={candle_cvd:.1f}, regime={regime}, structure={structure_direction}, direction={direction.value}")
+        if flow_features: rationale.append(f"orderflow delta={flow_features.delta:.4f}, cvd={flow_features.cvd:.4f}, buy_ratio={flow_features.buy_ratio:.3f}, aggression={flow_features.aggression:.3f}, vwap={flow_features.vwap:.4f}")
+        rationale.append(f"liquidity=orderbook+tradeflow, structure_strength={structure_strength:.1f}")
         return ScanCandidate(symbol=symbol, direction=direction, composite_score=round(composite, 2), component_scores=component_scores, rationale=rationale, entry_price=klines[-1].close, atr=atr, regime=regime)
     async def scan_all(self) -> List[ScanCandidate]:
         self._require_initialized(); reference_klines = None
