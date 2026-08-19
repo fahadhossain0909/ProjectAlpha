@@ -60,7 +60,7 @@ class BacktestEngine:
 
     def _metrics(self, curve: list[float]) -> BacktestMetrics:
         final = curve[-1] if curve else self.initial_cash
-        total_return = (final / self.initial_cash) - 1.0
+        total_return = round((final / self.initial_cash) - 1.0, 12)
         peak = self.initial_cash
         max_dd = 0.0
         for equity in curve:
