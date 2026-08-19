@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 pa = pytest.importorskip("pyarrow")
+import pyarrow.parquet as pq
 
 from aitos.backtest.parquet_stream import ParquetChunkReader
 from aitos.backtest.streaming import ChunkPlanner
@@ -21,7 +22,7 @@ def test_parquet_reader_prunes_time_window_and_columns(tmp_path):
         }
     )
     path = tmp_path / "trades.parquet"
-    pa.parquet.write_table(table, path)
+    pq.write_table(table, path)
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
