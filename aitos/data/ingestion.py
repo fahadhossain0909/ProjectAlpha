@@ -29,6 +29,9 @@ class DataIngestionService(AITOSModule):
         self._initialized = False; self._tasks: List[asyncio.Task] = []; self._last_event_time: Optional[str] = None
         self._ticks_processed = 0; self._liquidity_events = 0; self._orderflow_events = 0; self._errors = 0
         self._live_state = LiveMarketStateStore(max_trades=max(5000, self._liquidity_trade_window))
+        # Backward-compatible access for legacy ingestion consumers/tests. The
+        # canonical state remains LiveMarketStateStore.
+        self._recent_trades = self._live_state._trades
     @property
     def module_id(self) -> str: return "data-ingestion-service"
     @property
