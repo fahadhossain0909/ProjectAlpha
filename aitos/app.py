@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Protocol
@@ -39,6 +38,7 @@ from aitos.xai.ml_feedback import MLExplainerFeedbackLoop
 
 logger = get_logger("aitos.app")
 
+
 @dataclass
 class SystemComponents:
     event_bus: EventBus
@@ -51,7 +51,7 @@ class SystemComponents:
     decision_journal: DecisionJournalRepository
     performance_evaluator: DecisionPerformanceEvaluator
     policy_monitor: PolicyMonitorService
-    rl_scorer: TabularBanditRLScorer
+    rl_scorer: RLPolicyScorer
     rl_feedback: RLFeedbackLoop
     outcome_classifier: TradeOutcomeClassifier
     ml_feedback: MLExplainerFeedbackLoop
@@ -71,18 +71,20 @@ class SystemComponents:
         if self.correlation_updater is not None: modules.append(self.correlation_updater)
         return modules
 
+
 async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_executor: OrderExecutor, symbols: List[str],
                        kline_timeframe: str = "15m", scanner_timeframe: str = "15m", market_data_repository: Optional[MarketDataRepository] = None,
                        journal_repository: Optional[JournalRepository] = None, decision_journal_repository: Optional[DecisionJournalRepository] = None,
                        graph_driver: Optional[GraphDriver] = None, risk_limits: Optional[RiskLimits] = None, kernel: Optional[AIKernel] = None,
-                       rl_scorer: Optional[RLPolicyScorer] = None, use_exchange_side_stops: bool = False,
+                       rl_scorer: Optional[RLPolicyScorer] = None, outcome_classifier: Optional[TradeOutcomeClassifier] = None,
+                       attention_explainer: Optional[AttentionExplainer] = None, use_exchange_side_stops: bool = False,
                        min_score_threshold: float = 60.0, top_n: int = 5) -> SystemComponents:
     kernel = kernel or AIKernel(event_bus=event_bus); risk_engine = RiskEngine(event_bus=event_bus, limits=risk_limits)
     rl_scorer = rl_scorer or TabularBanditRLScorer()
     scanner = OpportunityScanner(event_bus=event_bus, exchange=exchange, symbols=symbols, timeframe=scanner_timeframe, rl_scorer=rl_scorer, min_score_threshold=min_score_threshold, top_n=top_n)
     rl_feedback = RLFeedbackLoop(event_bus=event_bus, scorer=rl_scorer)
-    outcome_classifier = TradeOutcomeClassifier(); ml_feedback = MLExplainerFeedbackLoop(event_bus=event_bus, classifier=outcome_classifier)
-    attention_explainer = AttentionExplainer(); attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
+    outcome_classifier = outcome_classifier or TradeOutcomeClassifier(); ml_feedback = MLExplainerFeedbackLoop(event_bus=event_bus, classifier=outcome_classifier)
+    attention_explainer = attention_explainer or AttentionExplainer(); attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
     trade_lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine, order_executor=order_executor, kernel=kernel, use_exchange_side_stops=use_exchange_side_stops)
     data_ingestion = DataIngestionService(exchange=exchange, event_bus=event_bus, symbols=symbols, kline_timeframe=kline_timeframe, repository=market_data_repository)
     decision_journal = decision_journal_repository or DecisionJournalRepository()
@@ -100,6 +102,7 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
         ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
         reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
+
 async def _health_status(module: AITOSModule):
     result = module.health_check()
     if inspect.isawaitable(result): return await result
@@ -107,6 +110,7 @@ async def _health_status(module: AITOSModule):
         async for status in result: return status
         raise RuntimeError(f"Module {module.module_id} returned an empty health-check stream")
     return result
+
 
 async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) -> None:
     for module in components.all_modules(): await module.initialize({})
@@ -118,14 +122,17 @@ async def initialize_all(components: SystemComponents, *, timeout: float = 5.0) 
         await asyncio.sleep(0.05)
     raise RuntimeError(f"Some modules failed to initialize within {timeout}s timeout")
 
+
 async def shutdown_all(components: SystemComponents, grace_period_seconds: float = 30.0) -> None:
     for sub in components._price_feed_subscriptions: sub.cancel()
     for module in reversed(components.all_modules()):
         try: await module.shutdown(grace_period_seconds)
         except Exception as exc: logger.error("error shutting down module", extra={"aitos_extra": {"module_id": module.module_id, "error": str(exc)}})
 
+
 class PortfolioTracker(Protocol):
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState: ...
+
 
 @dataclass
 class PaperPortfolioTracker:
@@ -140,7 +147,9 @@ class PaperPortfolioTracker:
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
         return PortfolioState(equity_usd=equity, peak_equity_usd=self._peak_equity_usd, positions=positions, daily_pnl_pct=(daily_pnl/equity*100) if equity else 0.0, weekly_pnl_pct=(weekly_pnl/equity*100) if equity else 0.0, regime=dominant_regime)
 
+
 def _parse_iso(value: str) -> datetime: return datetime.fromisoformat(value)
+
 
 class LivePortfolioTracker:
     def __init__(self, order_executor, asset: str = "USDT"): self._order_executor, self._asset = order_executor, asset; self._peak_equity_usd: Optional[float] = None; self._last_known_equity_usd = 0.0
@@ -151,6 +160,7 @@ class LivePortfolioTracker:
         for t in open_trades: regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
         return PortfolioState(equity_usd=self._last_known_equity_usd, peak_equity_usd=self._peak_equity_usd or self._last_known_equity_usd, positions=positions, regime=dominant_regime)
+
 
 async def run_scan_and_trade_cycle(components: SystemComponents, portfolio_tracker: PortfolioTracker, is_production: bool = False, approved_by: Optional[str] = None) -> int:
     refresh = getattr(portfolio_tracker, "refresh_equity", None)
