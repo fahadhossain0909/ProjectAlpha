@@ -12,6 +12,9 @@ from aitos.health_server import HealthServer
 from aitos.journal.repository import JournalRepository
 from aitos.learning.recorder import LearningExperienceRecorder
 from aitos.intelligence.deep_rl_policy import DeepValueRLScorer
+from aitos.xai.ml_explainer import TradeOutcomeClassifier
+from aitos.xai.attention_explainer import AttentionExplainer
+from aitos.xai.persistence import load_attention_model, save_attention_model
 from aitos.kernel.ai_kernel import AIKernel
 from aitos.live_trading import confirm_live_trading, prepare_live_executor
 from aitos.logging_setup import configure_logging, get_logger
@@ -44,7 +47,10 @@ async def main() -> None:
     event_bus = EventBus(redis_client=redis_client); await event_bus.initialize({})
     market_repo, journal_repo = await try_connect_clickhouse_repositories(settings); graph_driver = await try_connect_neo4j(settings)
     order_executor = await prepare_live_executor(settings, SYMBOLS); rl_scorer = DeepValueRLScorer(); rl_scorer.load_state()
-    components = await build_system(event_bus=event_bus, exchange=BinanceFuturesAdapter(), order_executor=order_executor, symbols=SYMBOLS, kline_timeframe=KLINE_TIMEFRAME, scanner_timeframe=KLINE_TIMEFRAME, market_data_repository=market_repo, journal_repository=journal_repo, graph_driver=graph_driver, kernel=AIKernel(event_bus=event_bus, require_human_approval_for_prod=True), rl_scorer=rl_scorer, use_exchange_side_stops=True)
+    outcome_classifier = TradeOutcomeClassifier(); outcome_classifier.load_state()
+    attention_path = "models/online_ml/attention_explainer.pkl"
+    attention_explainer = load_attention_model(attention_path) or AttentionExplainer()
+    components = await build_system(event_bus=event_bus, exchange=BinanceFuturesAdapter(), order_executor=order_executor, symbols=SYMBOLS, kline_timeframe=KLINE_TIMEFRAME, scanner_timeframe=KLINE_TIMEFRAME, market_data_repository=market_repo, journal_repository=journal_repo, graph_driver=graph_driver, kernel=AIKernel(event_bus=event_bus, require_human_approval_for_prod=True), rl_scorer=rl_scorer, outcome_classifier=outcome_classifier, attention_explainer=attention_explainer, use_exchange_side_stops=True)
     await initialize_all(components)
     experience_recorder = LearningExperienceRecorder(event_bus, market_repo, source="live"); await experience_recorder.initialize({})
     health_server = HealthServer(components.all_modules() + [experience_recorder], port=HEALTH_SERVER_PORT); await health_server.start()
@@ -53,14 +59,14 @@ async def main() -> None:
     try:
         while not stop_event.is_set():
             try:
-                submitted = await run_scan_and_trade_cycle(components, tracker, is_production=True, approved_by=approved_by); rl_scorer.save_state()
-                logger.info("live scan cycle complete", extra={"aitos_extra": {"submitted": submitted, "open_trades": len(components.trade_lifecycle.get_open_trades()), "account_equity_usd": tracker._last_known_equity_usd, "rl_samples": rl_scorer.n_samples_seen}})
+                submitted = await run_scan_and_trade_cycle(components, tracker, is_production=True, approved_by=approved_by); rl_scorer.save_state(); outcome_classifier.save_state(); save_attention_model(attention_explainer, attention_path)
+                logger.info("live scan cycle complete", extra={"aitos_extra": {"submitted": submitted, "open_trades": len(components.trade_lifecycle.get_open_trades()), "account_equity_usd": tracker._last_known_equity_usd, "rl_samples": rl_scorer.n_samples_seen, "ml_samples": outcome_classifier.n_samples_seen, "attention_samples": attention_explainer.n_samples_seen}})
                 if components.reconciliation is not None: await components.reconciliation.run_once()
             except Exception as exc: logger.error("scan/trade cycle failed: %s", exc)
             try: await asyncio.wait_for(stop_event.wait(), timeout=SCAN_INTERVAL_SECONDS)
             except asyncio.TimeoutError: pass
     finally:
-        rl_scorer.save_state(); await health_server.stop(); await experience_recorder.shutdown(); await shutdown_all(components); await order_executor.close()
+        rl_scorer.save_state(); outcome_classifier.save_state(); save_attention_model(attention_explainer, attention_path); await health_server.stop(); await experience_recorder.shutdown(); await shutdown_all(components); await order_executor.close()
         if market_repo is not None: await market_repo.shutdown()
         if journal_repo is not None: await journal_repo.shutdown()
         await redis_client.aclose()
