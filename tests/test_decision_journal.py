@@ -4,7 +4,8 @@ import pytest
 
 from aitos.core.contracts import Event
 from aitos.journal.journal_system import JournalSystem
-from aitos.models.trade import Opportunity, TradeLifecycleState, TradeSide
+from aitos.models.trade import TradeLifecycleState, TradeSide
+from aitos.models.trade import Opportunity
 from aitos.risk.models import PortfolioState
 from aitos.trading.lifecycle import TradeLifecycle
 
@@ -70,7 +71,8 @@ async def test_decision_snapshot_is_persisted_and_linked_to_trade(event_bus, ris
 
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
-    opportunity = make_opportunity(agent_consensus={"decision_id": opportunity.opportunity_id})
+    # Preserve the same opportunity/decision identity used by the snapshot.
+    opportunity.agent_consensus = {"decision_id": opportunity.opportunity_id}
     trade = await lifecycle.submit_opportunity(opportunity, PortfolioState(equity_usd=10_000.0, peak_equity_usd=10_000.0))
 
     assert await _wait_for(lambda: len(repo.decisions) == 1)
