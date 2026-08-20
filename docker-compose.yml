@@ -26,8 +26,8 @@ services:
     image: clickhouse/clickhouse-server:24.3-alpine
     container_name: aitos-clickhouse
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # native protocol
     environment:
       CLICKHOUSE_DB: aitos
       CLICKHOUSE_USER: default
@@ -47,12 +47,12 @@ services:
     image: neo4j:5.19-community
     container_name: aitos-neo4j
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "7474:7474"  # HTTP browser
+      - "7687:7687"  # Bolt protocol
     environment:
       NEO4J_AUTH: neo4j/changeme
       NEO4J_dbms_memory_pagecache_size: 512M
-      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_dbms_heap_max__size: 1G
     volumes:
       - aitos_neo4j_data:/data
       - aitos_neo4j_logs:/logs
@@ -64,6 +64,11 @@ services:
     restart: unless-stopped
 
   # -- Application containers ---------------------------------------------------
+  # Both build from the same image (./Dockerfile); only the command differs.
+  # *_HOST/*_URI below point at the other services by their Compose network
+  # name (e.g. "redis", not "localhost") -- everything else (log level,
+  # Binance credentials, etc.) still comes from .env via env_file.
+
   aitos-paper:
     build: .
     container_name: aitos-paper
@@ -75,7 +80,7 @@ services:
       CLICKHOUSE_HOST: clickhouse
       NEO4J_URI: bolt://neo4j:7687
     ports:
-      - "8090:8090"
+      - "8090:8090"  # health/metrics -- see aitos/health_server.py
     depends_on:
       redis:
         condition: service_healthy
@@ -91,9 +96,9 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # Historical backtesting is explicitly opt-in. It has no dependency on
-  # paper trading, Redis, ClickHouse, or Neo4j, and reads /data read-only.
-  # Resource limits prevent a large replay from starving a running paper bot.
+  # Historical backtesting -- opt-in only. It is deliberately independent
+  # from aitos-paper and reads historical data from /data in read-only mode.
+  # Resource limits reduce the chance that a large replay starves the paper bot.
   aitos-backtest:
     build: .
     command: ["python3", "-m", "aitos.backtest.cli"]
@@ -108,8 +113,11 @@ services:
 
   # LIVE TRADING -- real orders, real money. Requires BINANCE_API_KEY/
   # BINANCE_API_SECRET in .env, and needs an interactive terminal for its
-  # startup confirmation. It is deliberately excluded from the default
-  # Compose profile.
+  # startup confirmation (aitos/live_trading.py) -- run it with
+  # `docker compose run --rm aitos-live`, NOT `docker compose up -d`,
+  # or the confirmation prompt has no stdin to read from. Deliberately
+  # excluded from the default Compose profile and given no restart
+  # policy -- see deploy/aitos-live.service for why.
   aitos-live:
     build: .
     container_name: aitos-live
