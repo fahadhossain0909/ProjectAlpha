@@ -14,7 +14,8 @@ Historical / Paper / Live
           |
           +--> Experience Store
                     |
-                    +--> RL feedback
+                    +--> Online RL feedback (paper/live)
+                    +--> Historical learning worker (backtest)
                     +--> Evolution proposals
                     +--> Evaluation
                     +--> Model registry
@@ -26,7 +27,7 @@ ClickHouse is the long-lived source of market history and learning evidence. Red
 
 `learning_experiences` is append-only. A paper/live decision is recorded when `journal.decision_recorded` is emitted, and the later outcome is recorded when `journal.outcome_attributed` is emitted. The records retain source, symbol, decision, confidence, features, market state, risk state, strategy/model versions, and identifiers linking the evidence.
 
-Backtests can also persist a completed-run summary with `--persist-learning`.
+Backtests can persist both a completed-run summary **and realized trade outcomes** with `--persist-learning`. Realized outcomes include the historical event timestamp, reward/P&L, price, and numeric event features so they can be replayed by the learning worker.
 
 ## Historical data for backtests
 
@@ -69,9 +70,11 @@ No automatic production promotion is enabled by the continual-learning foundatio
 
 ## Continual model learning
 
-The existing `RLFeedbackLoop` updates the configured trainable scorer after every closed trade. This is an online learning path, not a one-shot training job. The repository also contains the neural `DeepValueRLScorer`; it is a value-function approximator trained online from realized R-multiple outcomes, not a claim of full actor-critic/policy-gradient RL.
+The existing `RLFeedbackLoop` updates the configured trainable scorer after every closed paper/live trade. This is an online learning path, not a one-shot training job. The repository also contains the neural `DeepValueRLScorer`; it is a value-function approximator trained online from realized R-multiple outcomes, not a claim of full actor-critic/policy-gradient RL.
 
-Model artifacts are versioned in the model registry. Candidate/champion/archived states make promotion and rollback auditable.
+The `aitos-learning` Compose service runs `run_continual_learning.py` continuously. It replays persisted **backtest** outcomes from ClickHouse into the same durable neural scorer. Paper/live outcomes are deliberately not replayed by this worker because `RLFeedbackLoop` already trains from those events in real time; this avoids duplicate updates after a restart.
+
+Model artifacts are persisted on the shared `/models` volume. Candidate/champion/archived states make promotion and rollback auditable.
 
 ## VPS operation
 
@@ -87,6 +90,8 @@ docker compose --profile backtest run --rm aitos-backtest \
 ```
 
 Paper trading does not need to be stopped for this command. The backtest container is execution-isolated and historical input is read-only.
+
+The learning worker starts with the normal stack and is resource-limited so it does not compete aggressively with paper trading.
 
 ## Production safety boundary
 
