@@ -20,6 +20,7 @@ from aitos.intelligence.scanner import OpportunityScanner
 from aitos.journal.decision_repository import DecisionJournalRepository
 from aitos.journal.journal_system import JournalSystem
 from aitos.journal.performance_evaluator import DecisionPerformanceEvaluator
+from aitos.journal.policy_monitor_service import PolicyMonitorService
 from aitos.journal.repository import JournalRepository
 from aitos.kernel.ai_kernel import AIKernel
 from aitos.knowledge_graph.correlation_updater import SymbolCorrelationUpdater
@@ -48,6 +49,7 @@ class SystemComponents:
     journal: JournalSystem
     decision_journal: DecisionJournalRepository
     performance_evaluator: DecisionPerformanceEvaluator
+    policy_monitor: PolicyMonitorService
     rl_scorer: TabularBanditRLScorer
     rl_feedback: RLFeedbackLoop
     outcome_classifier: TradeOutcomeClassifier
@@ -60,10 +62,8 @@ class SystemComponents:
     _price_feed_subscriptions: List[Subscription] = field(default_factory=list)
 
     def all_modules(self) -> List[AITOSModule]:
-        modules: List[AITOSModule] = [
-            self.event_bus, self.kernel, self.risk_engine, self.decision_journal,
-            self.journal, self.performance_evaluator, self.rl_feedback, self.ml_feedback, self.attention_feedback,
-        ]
+        modules: List[AITOSModule] = [self.event_bus, self.kernel, self.risk_engine, self.decision_journal,
+            self.journal, self.performance_evaluator, self.policy_monitor, self.rl_feedback, self.ml_feedback, self.attention_feedback]
         if self.knowledge_graph is not None: modules.append(self.knowledge_graph)
         modules += [self.data_ingestion, self.scanner, self.trade_lifecycle]
         if self.reconciliation is not None: modules.append(self.reconciliation)
@@ -76,11 +76,9 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
                        graph_driver: Optional[GraphDriver] = None, risk_limits: Optional[RiskLimits] = None, kernel: Optional[AIKernel] = None,
                        rl_scorer: Optional[RLPolicyScorer] = None, use_exchange_side_stops: bool = False,
                        min_score_threshold: float = 60.0, top_n: int = 5) -> SystemComponents:
-    kernel = kernel or AIKernel(event_bus=event_bus)
-    risk_engine = RiskEngine(event_bus=event_bus, limits=risk_limits)
+    kernel = kernel or AIKernel(event_bus=event_bus); risk_engine = RiskEngine(event_bus=event_bus, limits=risk_limits)
     rl_scorer = rl_scorer or TabularBanditRLScorer()
-    scanner = OpportunityScanner(event_bus=event_bus, exchange=exchange, symbols=symbols, timeframe=scanner_timeframe, rl_scorer=rl_scorer,
-        min_score_threshold=min_score_threshold, top_n=top_n)
+    scanner = OpportunityScanner(event_bus=event_bus, exchange=exchange, symbols=symbols, timeframe=scanner_timeframe, rl_scorer=rl_scorer, min_score_threshold=min_score_threshold, top_n=top_n)
     rl_feedback = RLFeedbackLoop(event_bus=event_bus, scorer=rl_scorer)
     outcome_classifier = TradeOutcomeClassifier(); ml_feedback = MLExplainerFeedbackLoop(event_bus=event_bus, classifier=outcome_classifier)
     attention_explainer = AttentionExplainer(); attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
@@ -89,25 +87,23 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
     decision_journal = decision_journal_repository or DecisionJournalRepository()
     journal = JournalSystem(event_bus=event_bus, repository=journal_repository, risk_engine=risk_engine, decision_repository=decision_journal)
     performance_evaluator = DecisionPerformanceEvaluator(decision_journal)
+    policy_monitor = PolicyMonitorService(event_bus=event_bus)
     reconciliation = ReconciliationScheduler(trade_lifecycle=trade_lifecycle, event_bus=event_bus) if order_executor.supports_exchange_side_stops and use_exchange_side_stops else None
     knowledge_graph = correlation_updater = None
     if graph_driver is not None:
         knowledge_graph = KnowledgeGraphWriter(event_bus=event_bus, driver=graph_driver)
         correlation_updater = SymbolCorrelationUpdater(exchange=exchange, graph_writer=knowledge_graph, symbols=symbols, timeframe=scanner_timeframe)
     return SystemComponents(event_bus=event_bus, kernel=kernel, risk_engine=risk_engine, data_ingestion=data_ingestion, scanner=scanner,
-        trade_lifecycle=trade_lifecycle, journal=journal, decision_journal=decision_journal, performance_evaluator=performance_evaluator, rl_scorer=rl_scorer,
-        rl_feedback=rl_feedback, outcome_classifier=outcome_classifier, ml_feedback=ml_feedback,
-        attention_explainer=attention_explainer, attention_feedback=attention_feedback,
+        trade_lifecycle=trade_lifecycle, journal=journal, decision_journal=decision_journal, performance_evaluator=performance_evaluator,
+        policy_monitor=policy_monitor, rl_scorer=rl_scorer, rl_feedback=rl_feedback, outcome_classifier=outcome_classifier,
+        ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
         reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
 async def _health_status(module: AITOSModule):
-    """Resolve both coroutine and async-generator health-check contracts."""
     result = module.health_check()
-    if inspect.isawaitable(result):
-        return await result
+    if inspect.isawaitable(result): return await result
     if inspect.isasyncgen(result):
-        async for status in result:
-            return status
+        async for status in result: return status
         raise RuntimeError(f"Module {module.module_id} returned an empty health-check stream")
     return result
 
@@ -136,13 +132,9 @@ class PaperPortfolioTracker:
     _peak_equity_usd: float = field(init=False)
     def __post_init__(self) -> None: self._peak_equity_usd = self.starting_equity_usd
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState:
-        closed, open_trades = trade_lifecycle.get_closed_trades(), trade_lifecycle.get_open_trades()
-        realized_pnl = sum(t.pnl for t in closed if t.pnl is not None); equity = self.starting_equity_usd + realized_pnl; self._peak_equity_usd = max(self._peak_equity_usd, equity)
-        day_ago, week_ago = datetime.now(timezone.utc)-timedelta(days=1), datetime.now(timezone.utc)-timedelta(days=7)
-        daily_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= day_ago)
-        weekly_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= week_ago)
-        positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades)
-        regime_counts: Dict[str, int] = {}
+        closed, open_trades = trade_lifecycle.get_closed_trades(), trade_lifecycle.get_open_trades(); realized_pnl = sum(t.pnl for t in closed if t.pnl is not None); equity = self.starting_equity_usd + realized_pnl; self._peak_equity_usd = max(self._peak_equity_usd, equity)
+        day_ago, week_ago = datetime.now(timezone.utc)-timedelta(days=1), datetime.now(timezone.utc)-timedelta(days=7); daily_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= day_ago); weekly_pnl = sum(t.pnl for t in closed if t.pnl is not None and t.exit_time and _parse_iso(t.exit_time) >= week_ago)
+        positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades); regime_counts: Dict[str, int] = {}
         for t in open_trades: regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
         return PortfolioState(equity_usd=equity, peak_equity_usd=self._peak_equity_usd, positions=positions, daily_pnl_pct=(daily_pnl/equity*100) if equity else 0.0, weekly_pnl_pct=(weekly_pnl/equity*100) if equity else 0.0, regime=dominant_regime)
@@ -150,13 +142,11 @@ class PaperPortfolioTracker:
 def _parse_iso(value: str) -> datetime: return datetime.fromisoformat(value)
 
 class LivePortfolioTracker:
-    def __init__(self, order_executor, asset: str = "USDT"):
-        self._order_executor, self._asset = order_executor, asset; self._peak_equity_usd: Optional[float] = None; self._last_known_equity_usd = 0.0
+    def __init__(self, order_executor, asset: str = "USDT"): self._order_executor, self._asset = order_executor, asset; self._peak_equity_usd: Optional[float] = None; self._last_known_equity_usd = 0.0
     async def refresh_equity(self) -> float:
         equity = await self._order_executor.get_account_balance(self._asset); self._last_known_equity_usd = equity; self._peak_equity_usd = equity if self._peak_equity_usd is None else max(self._peak_equity_usd, equity); return equity
     def build_portfolio_state(self, trade_lifecycle: TradeLifecycle) -> PortfolioState:
-        open_trades = trade_lifecycle.get_open_trades(); positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades)
-        regime_counts: Dict[str, int] = {}
+        open_trades = trade_lifecycle.get_open_trades(); positions = tuple(PositionExposure(symbol=t.symbol, notional_usd=t.position_size_usd, leverage=t.leverage) for t in open_trades); regime_counts: Dict[str, int] = {}
         for t in open_trades: regime_counts[t.regime] = regime_counts.get(t.regime, 0) + 1
         dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
         return PortfolioState(equity_usd=self._last_known_equity_usd, peak_equity_usd=self._peak_equity_usd or self._last_known_equity_usd, positions=positions, regime=dominant_regime)
@@ -164,20 +154,14 @@ class LivePortfolioTracker:
 async def run_scan_and_trade_cycle(components: SystemComponents, portfolio_tracker: PortfolioTracker, is_production: bool = False, approved_by: Optional[str] = None) -> int:
     refresh = getattr(portfolio_tracker, "refresh_equity", None)
     if refresh is not None: await refresh()
-    portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle); await components.risk_engine.assess(portfolio)
-    candidates = await components.scanner.scan_all(); ranked = await components.scanner.rank(candidates)
-    open_symbols = {t.symbol for t in components.trade_lifecycle.get_open_trades()}; submitted = 0
+    portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle); await components.risk_engine.assess(portfolio); candidates = await components.scanner.scan_all(); ranked = await components.scanner.rank(candidates); open_symbols = {t.symbol for t in components.trade_lifecycle.get_open_trades()}; submitted = 0
     for candidate in ranked:
         if candidate.symbol in open_symbols: continue
         decision = await components.scanner.decide_with_kernel(candidate, components.kernel)
-        if decision.direction != candidate.direction.value.lower() or decision.confidence < components.kernel.fusion_min_confidence:
-            logger.info("kernel vetoed candidate", extra={"aitos_extra": {"symbol": candidate.symbol, "scanner_direction": candidate.direction.value, "kernel_direction": decision.direction, "confidence": decision.confidence}})
-            continue
-        opportunity = components.scanner.to_opportunity(candidate, is_production=is_production, approved_by=approved_by)
-        decision_id = opportunity.opportunity_id
+        if decision.direction != candidate.direction.value.lower() or decision.confidence < components.kernel.fusion_min_confidence: continue
+        opportunity = components.scanner.to_opportunity(candidate, is_production=is_production, approved_by=approved_by); decision_id = opportunity.opportunity_id
         opportunity = replace(opportunity, confidence=min(opportunity.confidence, decision.confidence), rationale=f"kernel_confidence={decision.confidence:.4f}; " + opportunity.rationale, agent_consensus={**opportunity.agent_consensus, "kernel_fusion_confidence": decision.confidence, "decision_id": decision_id})
         await components.event_bus.publish(Event(topic="decision.snapshot", payload={"decision_id": decision_id, "symbol": opportunity.symbol, "side": opportunity.side.value, "entry_price": opportunity.entry_price, "stop_loss_price": opportunity.stop_loss_price, "take_profit_levels": list(opportunity.take_profit_levels), "confidence": opportunity.confidence, "strategy_id": opportunity.strategy_id, "rationale": opportunity.rationale, "agent_consensus": dict(opportunity.agent_consensus), "regime": opportunity.regime, "detected_at": opportunity.detected_at, "is_production": opportunity.is_production, "approved_by": opportunity.approved_by, "kernel_direction": decision.direction, "kernel_confidence": decision.confidence}, source_module="aitos.app"))
-        current_portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle)
-        trade = await components.trade_lifecycle.submit_opportunity(opportunity, current_portfolio); submitted += 1
+        trade = await components.trade_lifecycle.submit_opportunity(opportunity, portfolio_tracker.build_portfolio_state(components.trade_lifecycle)); submitted += 1
         if trade.state == TradeLifecycleState.POSITION_OPENED: open_symbols.add(candidate.symbol)
     return submitted
