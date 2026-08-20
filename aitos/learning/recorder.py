@@ -1,6 +1,7 @@
 """Event-driven persistence of paper/live decisions and outcomes."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from aitos.core.contracts import AITOSModule, Event, EventResponse, HealthStatus, ModuleStatus
@@ -9,14 +10,13 @@ from aitos.data.repository import MarketDataRepository
 from .experience import ExperienceRecord
 
 
+def _event_time(event: Event) -> datetime:
+    value = datetime.fromisoformat(event.created_at.replace("Z", "+00:00"))
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class LearningExperienceRecorder(AITOSModule):
-    """Turn decision/outcome events into durable learning experiences.
-
-    The recorder is deliberately append-only. A decision and its later outcome
-    are separate records linked by ``decision_id`` so historical evidence is
-    never overwritten and can be replayed by training/evaluation jobs.
-    """
-
+    """Turn decision/outcome events into durable learning experiences."""
     def __init__(self, event_bus: EventBus, repository: Optional[MarketDataRepository], source: str) -> None:
         if source not in {"paper", "live"}:
             raise ValueError("source must be paper or live")
@@ -29,56 +29,44 @@ class LearningExperienceRecorder(AITOSModule):
         self._last_event_time: Optional[str] = None
 
     @property
-    def module_id(self) -> str:
-        return f"learning-experience-recorder-{self._source}"
-
+    def module_id(self) -> str: return f"learning-experience-recorder-{self._source}"
     @property
-    def version(self) -> str:
-        return "1.0.0"
+    def version(self) -> str: return "1.0.1"
 
     async def initialize(self, config: Dict[str, Any]) -> None:
-        if self._initialized:
-            return
-        if self._repository is not None:
-            await self._repository.ensure_learning_experience_schema()
+        if self._initialized: return
+        if self._repository is not None: await self._repository.ensure_learning_experience_schema()
         self._subscriptions.extend([
-            await self._event_bus.subscribe("decision.recorded", self._on_decision, group=f"learning-{self._source}"),
+            await self._event_bus.subscribe("journal.decision_recorded", self._on_decision, group=f"learning-{self._source}"),
             await self._event_bus.subscribe("journal.outcome_attributed", self._on_outcome, group=f"learning-{self._source}"),
         ])
         self._initialized = True
 
     async def health_check(self) -> HealthStatus:
-        return HealthStatus(
-            module_id=self.module_id,
-            status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,
-            latency_ms=0.0,
-            last_event_time=self._last_event_time,
-            details={"records_written": self._records_written, "source": self._source},
-        )
+        return HealthStatus(module_id=self.module_id,
+                            status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,
+                            latency_ms=0.0, last_event_time=self._last_event_time,
+                            details={"records_written": self._records_written, "source": self._source})
 
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
-        for sub in self._subscriptions:
-            sub.cancel()
+        for sub in self._subscriptions: sub.cancel()
         self._subscriptions.clear()
 
     async def emit_events(self) -> AsyncIterator[Event]:
         return
         yield  # pragma: no cover
 
-    async def handle_event(self, event: Event) -> Optional[EventResponse]:
-        return None
+    async def handle_event(self, event: Event) -> Optional[EventResponse]: return None
 
     async def _write(self, record: ExperienceRecord) -> None:
-        if self._repository is None:
-            return
-        await self._repository.save_learning_experience(record)
-        self._records_written += 1
+        if self._repository is not None:
+            await self._repository.save_learning_experience(record)
+            self._records_written += 1
 
     async def _on_decision(self, event: Event) -> Optional[EventResponse]:
         p = dict(event.payload)
         record = ExperienceRecord(
-            timestamp=event.created_at_dt,
-            source=self._source,
+            timestamp=_event_time(event), source=self._source,
             symbol=str(p.get("symbol", "unknown")),
             decision=str(p.get("side", p.get("direction", "unknown"))),
             confidence=float(p.get("confidence", 0.0) or 0.0),
@@ -98,20 +86,12 @@ class LearningExperienceRecorder(AITOSModule):
     async def _on_outcome(self, event: Event) -> Optional[EventResponse]:
         p = dict(event.payload)
         pnl = p.get("pnl")
-        if pnl is None:
-            return None
+        if pnl is None: return None
         record = ExperienceRecord(
-            timestamp=event.created_at_dt,
-            source=self._source,
-            symbol=str(p.get("symbol", "unknown")),
-            decision=str(p.get("side", "outcome")),
-            outcome="closed",
-            reward=float(pnl),
-            metadata={
-                "decision_id": str(p.get("decision_id", "")),
-                "trade_id": str(p.get("trade_id", "")),
-                "event_type": "outcome",
-            },
+            timestamp=_event_time(event), source=self._source,
+            symbol=str(p.get("symbol", "unknown")), decision=str(p.get("side", "outcome")),
+            outcome="closed", reward=float(pnl),
+            metadata={"decision_id": str(p.get("decision_id", "")), "trade_id": str(p.get("trade_id", "")), "event_type": "outcome"},
         )
         await self._write(record)
         self._last_event_time = event.created_at
