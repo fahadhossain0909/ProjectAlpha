@@ -1,38 +1,57 @@
 # ProjectAlpha VPS Backtesting
 
-The backtest runner is an **opt-in Compose service**. It is separate from
-`aitos-paper`, has no restart policy, reads historical data read-only, and is
-resource-limited so a replay is less likely to starve a running paper bot.
+ProjectAlpha has one canonical backtesting stack with two execution modes:
 
-## 1. Prepare historical data
+- **Canonical price-event mode**: deterministic `BacktestEngine` for lightweight OHLCV/trade studies.
+- **Full ProjectAlpha market mode**: `ProjectAlphaHistoricalRunner` for trade + L2 replay, shared order-flow/footprint/liquidity/auction intelligence, L2 execution, passive queue simulation, and perpetual margin checks.
 
-Place a JSONL file or Parquet dataset under the VPS data directory. The
-Compose service mounts `${BACKTEST_DATA_DIR:-./data}` as `/data:ro`.
+Both modes are read-only with respect to historical market data. Both can persist summarized learning experiences when explicitly requested by their integration layer.
 
-For the CLI's generic deterministic engine, each event needs at least:
+## 1. Preferred data source: ClickHouse
 
-```json
-{"timestamp":"2026-01-01T00:00:00Z","price":100.0}
-```
+ClickHouse is the long-lived historical source. Paper/live ingestion should persist the market history there so future backtests do not require downloading the same period again.
 
-Additional fields are preserved on the event object and can be consumed by a
-custom strategy.
+For the full market replay, the source reads:
 
-## 2. Build the image
+- `trade_ticks`
+- `order_book_snapshots`
 
-From the repository directory:
+For the lightweight engine it can additionally read `market_ohlcv`.
+
+All queries are bounded by symbol/time range and are read-only.
+
+## 2. Full L2/futures replay from ClickHouse
+
+Run the full ProjectAlpha engine directly against the historical data already stored in ClickHouse:
 
 ```bash
-docker compose build aitos-backtest
+docker compose --profile backtest run --rm aitos-backtest \
+  python3 -m aitos.backtest.rich_cli \
+  --source clickhouse \
+  --symbol BTCUSDT \
+  --tick-size 0.10 \
+  --start 2026-01-01T00:00:00Z \
+  --end 2026-02-01T00:00:00Z \
+  --initial-cash 10000 \
+  --fee-rate 0.0004 \
+  --slippage-bps 1 \
+  --leverage 1
 ```
 
-This does **not** start paper trading.
+Use a custom decision module with the same contract:
 
-## 3. Run a backtest while paper trading is running
+```python
+def strategy(state) -> HistoricalDecision:
+    ...
+```
 
-Paper trading does not need to be stopped for this isolated service. Use the
-full command below because `docker compose run` replaces the service command
-with the command supplied after the service name.
+and pass it with `--decision-strategy package.module:function`.
+
+The CLI returns JSON including decisions, fills, requested/filled quantity, final equity, return, fees, funding, liquidation status, and passive-order statistics.
+
+## 3. Lightweight deterministic replay
+
+For generic timestamp/price datasets:
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
@@ -40,11 +59,10 @@ docker compose --profile backtest run --rm aitos-backtest \
   --data /data/events.jsonl \
   --strategy aitos.backtest.cli:buy_and_hold \
   --initial-cash 10000 \
-  --fee-rate 0.0004 \
-  --slippage-bps 0
+  --fee-rate 0.0004
 ```
 
-For a Parquet dataset:
+Parquet is supported as well:
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
@@ -54,63 +72,77 @@ docker compose --profile backtest run --rm aitos-backtest \
   --strategy aitos.backtest.cli:buy_and_hold
 ```
 
-The command prints JSON containing final equity, return, drawdown, Sharpe,
-fees, trades, win rate, and profit factor.
+## 4. Full market replay from files
 
-## 4. Use a custom strategy
-
-A strategy is a Python callable with this contract:
-
-```python
-def strategy(event, execution):
-    # inspect event.price and any other event fields
-    # use execution.execute("buy" or "sell", quantity, price)
-    pass
-```
-
-Pass it as `module:function`, for example:
+If ClickHouse does not yet contain the requested period, the full runner can consume JSONL/Parquet rows with `event_type=trade` or `event_type=orderbook`:
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
-  python3 -m aitos.backtest.cli \
-  --data /data/events.jsonl \
-  --strategy my_strategy:strategy
+  python3 -m aitos.backtest.rich_cli \
+  --source file \
+  --data /data/market-events.parquet \
+  --format parquet \
+  --symbol BTCUSDT \
+  --tick-size 0.10
 ```
 
-The module must be included in the image/repository or otherwise installed in
-the container.
+This is a fallback/import path, not the normal long-term storage strategy.
 
-## 5. Paper-trading safety
+## 5. Learning and evaluation
 
-The backtest service does not depend on Redis, ClickHouse, Neo4j, or
-`aitos-paper`. It has no network ports and mounts historical data read-only.
-It also has a 2 CPU / 3 GiB memory limit in Compose.
-
-Therefore the normal workflow is:
+A backtest is an experiment, not an automatic production deployment. Candidate strategy/model changes must go through the canonical validation path:
 
 ```text
-Paper trading:  RUNNING  ───────────────────────────────►
-Backtest:                 START ───── RUN ───── END
+Candidate
+  -> canonical backtest
+  -> walk-forward validation
+  -> locked holdout
+  -> paper/shadow validation
+  -> governance gate
+  -> champion model/strategy
 ```
 
-Do not use `docker compose down -v` just to run a backtest; that command can
-delete persistent Compose volumes.
+Historical backtest results can be persisted into the shared Experience Store so the continual-learning layer can use them alongside paper/live experience. Production promotion is intentionally not automatic.
 
-## 6. Check status and logs
+## 6. Paper-trading safety
+
+The backtest service is an opt-in Compose profile and is separate from `aitos-paper`. It has no public network port, mounts file data read-only, and is resource-limited.
+
+Paper trading can remain running while a backtest executes:
+
+```text
+Paper trading:  RUNNING  -------------------------------->
+Backtest:                 START ---- RUN ---- END
+```
+
+Do not use `docker compose down -v` just to run a backtest; persistent database/model volumes must be preserved.
+
+## 7. Operational commands
+
+Check services:
 
 ```bash
 docker compose ps
 docker compose logs -f aitos-paper
+docker compose logs -f aitos-learning
 ```
 
-The backtest uses `--rm`, so its container is removed automatically after the
-run. If a run fails, inspect the command output first; the paper container is
-not restarted by the backtest service.
+Run the learning worker explicitly if needed:
 
-## Important limitation
+```bash
+docker compose up -d aitos-learning
+```
 
-The CLI currently drives the deterministic `BacktestEngine` using timestamp /
-price events. ProjectAlpha also contains the richer L2/futures historical
-runner (`ProjectAlphaHistoricalRunner`). Wiring that runner into the CLI is a
-separate step and should be done once the exact historical dataset schema and
-strategy-decision interface are finalized.
+Stop only paper trading without deleting data:
+
+```bash
+docker compose stop aitos-paper
+```
+
+Start it again:
+
+```bash
+docker compose start aitos-paper
+```
+
+Never use `down -v` for routine stop/restart operations.
