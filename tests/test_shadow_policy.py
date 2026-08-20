@@ -15,6 +15,8 @@ def test_shadow_evaluation_does_not_promote_weak_candidate():
     candidate = AdaptivePolicyEngine(min_trades=10).propose(report, "cand-shadow")
     result = evaluate_shadow(report, candidate)
     assert result.candidate_id == "cand-shadow"
-    assert result.candidate_trades == 20
-    assert result.candidate_pnl == 4.0
-    assert result.eligible_for_promotion is True
+    # Insufficiently sampled regimes stay enabled at the baseline policy;
+    # therefore the shadow set includes both historical regime slices.
+    assert result.candidate_trades == 30
+    assert result.candidate_pnl == 3.0
+    assert result.eligible_for_promotion is False
