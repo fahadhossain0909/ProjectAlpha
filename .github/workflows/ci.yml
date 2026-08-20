@@ -15,7 +15,6 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     name: Lint & Code Quality
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
@@ -45,6 +44,26 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     timeout-minutes: 45
+    env:
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_PORT: '8123'
+      CLICKHOUSE_USER: aitos_test
+      CLICKHOUSE_PASSWORD: aitos_test_password
+      CLICKHOUSE_DATABASE: aitos
+      TESTING: 'true'
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.12-alpine
+        env:
+          CLICKHOUSE_USER: aitos_test
+          CLICKHOUSE_PASSWORD: aitos_test_password
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
@@ -77,6 +96,13 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           pip install pytest pytest-cov
+      - name: Initialize ClickHouse test database
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8123/ping >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" 'http://127.0.0.1:8123/' --data-binary 'CREATE DATABASE IF NOT EXISTS aitos'
       - name: Verify decision_fusion.py before pytest
         run: |
           set -euxo pipefail
@@ -95,6 +121,11 @@ jobs:
           SECRET_KEY=${{ secrets.SECRET_KEY }}
           DEBUG=true
           TESTING=true
+          CLICKHOUSE_HOST=$CLICKHOUSE_HOST
+          CLICKHOUSE_PORT=$CLICKHOUSE_PORT
+          CLICKHOUSE_USER=$CLICKHOUSE_USER
+          CLICKHOUSE_PASSWORD=$CLICKHOUSE_PASSWORD
+          CLICKHOUSE_DATABASE=$CLICKHOUSE_DATABASE
           EOF
       - name: Diagnose decision_fusion import path
         env:
@@ -108,7 +139,6 @@ jobs:
           import hashlib
           import importlib.util
           import sys
-
           path = Path("aitos/kernel/decision_fusion.py").resolve()
           data = path.read_bytes()
           source = data.decode("utf-8")
@@ -117,14 +147,8 @@ jobs:
           print("BYTES:", len(data))
           print("SHA256:", hashlib.sha256(data).hexdigest())
           print("LINE_COUNT:", len(source.splitlines()))
-          print("LINE_134:", repr(source.splitlines()[133] if len(source.splitlines()) > 133 else "<missing>"))
-          print("SOURCE_125_145:")
-          for number, line in enumerate(source.splitlines()[124:145], start=125):
-              print(f"{number}: {line!r}")
-
           ast.parse(source, filename=str(path))
           print("AST_PARSE: OK")
-
           module_name = "decision_fusion_direct"
           spec = importlib.util.spec_from_file_location(module_name, path)
           if spec is None or spec.loader is None:
