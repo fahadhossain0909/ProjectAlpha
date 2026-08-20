@@ -1,9 +1,9 @@
-"""Durable continual-learning worker for paper/live/backtest experiences.
+"""Durable continual-learning worker for historical backtest experiences.
 
-The worker is intentionally conservative: it learns continuously from closed
-experiences, persists its model state, and never promotes a strategy or model
-into production. Candidate evolution remains behind the canonical validation
-and governance path.
+Paper/live trades already update the online scorer through the event-driven
+RLFeedbackLoop. This worker therefore replays persisted *backtest* outcomes,
+which makes historical learning durable without double-training paper/live
+experiences after a restart.
 """
 from __future__ import annotations
 
@@ -19,12 +19,7 @@ from aitos.intelligence.deep_rl_policy import DeepValueRLScorer
 
 
 class ContinualLearningWorker:
-    """Poll ClickHouse and incrementally train the online value scorer.
-
-    Decision records provide the state/features; outcome records provide the
-    reward. The pair is joined by ``metadata_json.decision_id``. Processed
-    outcome IDs are persisted so a restart does not retrain the same experience.
-    """
+    """Poll ClickHouse and incrementally learn from persisted backtests."""
 
     def __init__(
         self,
@@ -40,9 +35,7 @@ class ContinualLearningWorker:
         batch_limit: int = 5000,
         poll_seconds: int = 60,
     ) -> None:
-        self.client = clickhouse_connect.get_client(
-            host=host, port=port, username=user, password=password, database=database
-        )
+        self.client = clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database)
         self.database = database
         self.state_path = Path(state_path)
         self.batch_limit = batch_limit
@@ -61,7 +54,7 @@ class ContinualLearningWorker:
             return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
-            self._processed = set(str(x) for x in data.get("processed_outcomes", []))
+            self._processed = set(str(x) for x in data.get("processed_experiences", []))
         except (OSError, ValueError, TypeError):
             self._processed = set()
 
@@ -69,7 +62,7 @@ class ContinualLearningWorker:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "processed_outcomes": sorted(self._processed)[-10000:],
+            "processed_experiences": sorted(self._processed)[-10000:],
             "n_samples_seen": self.scorer.n_samples_seen,
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
@@ -79,10 +72,10 @@ class ContinualLearningWorker:
     def _rows(self) -> list[dict[str, Any]]:
         start = datetime.now(timezone.utc) - self.lookback
         sql = f"""
-        SELECT experience_id, timestamp, source, symbol, decision, outcome,
-               reward, features_json, metadata_json
+        SELECT experience_id, source, symbol, outcome, reward, features_json
         FROM {self.database}.learning_experiences
-        WHERE timestamp >= {{start:DateTime64(3)}}
+        WHERE source = 'backtest' AND outcome IS NOT NULL
+          AND timestamp >= {{start:DateTime64(3)}}
         ORDER BY timestamp ASC
         LIMIT {{limit:UInt32}}
         """
@@ -90,47 +83,30 @@ class ContinualLearningWorker:
         return [dict(zip(result.column_names, row)) for row in result.result_rows]
 
     @staticmethod
-    def _json_object(value: Any) -> dict[str, Any]:
-        if isinstance(value, dict):
-            return value
+    def _numeric_features(features: Any) -> dict[str, float]:
         try:
-            parsed = json.loads(value or "{}")
-            return parsed if isinstance(parsed, dict) else {}
+            value = json.loads(features or "{}") if not isinstance(features, dict) else features
         except (TypeError, ValueError):
             return {}
-
-    @staticmethod
-    def _numeric_features(features: dict[str, Any]) -> dict[str, float]:
-        result: dict[str, float] = {}
-        for key, value in features.items():
-            if isinstance(value, bool):
-                result[key] = float(value)
-            elif isinstance(value, (int, float)):
-                result[key] = float(value)
-        return result
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): float(raw)
+            for key, raw in value.items()
+            if isinstance(raw, (int, float, bool))
+        }
 
     def run_once(self) -> int:
         rows = self._rows()
-        decisions: dict[str, dict[str, Any]] = {}
         for row in rows:
-            metadata = self._json_object(row["metadata_json"])
-            decision_id = str(metadata.get("decision_id", ""))
-            if row["outcome"] is None:
-                if decision_id:
-                    decisions[decision_id] = row
+            experience_id = str(row["experience_id"])
+            if experience_id in self._processed:
                 continue
-            outcome_id = str(row["experience_id"])
-            if outcome_id in self._processed or not decision_id:
-                continue
-            decision = decisions.get(decision_id)
-            if decision is None:
-                continue
-            features = self._numeric_features(self._json_object(decision["features_json"]))
+            features = self._numeric_features(row["features_json"])
             if not features:
                 continue
             self.scorer.update(str(row["symbol"]), features, float(row["reward"] or 0.0))
-            self._processed.add(outcome_id)
-
+            self._processed.add(experience_id)
         if rows:
             self.scorer.save_state()
             self._save_state()
