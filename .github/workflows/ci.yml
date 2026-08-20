@@ -47,6 +47,9 @@ jobs:
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.12-alpine
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ''
         ports:
           - 8123:8123
         options: >-
@@ -92,7 +95,7 @@ jobs:
             if curl -fsS http://127.0.0.1:8123/ping >/dev/null; then break; fi
             sleep 1
           done
-          curl -fsS 'http://127.0.0.1:8123/' --data-binary 'CREATE DATABASE IF NOT EXISTS aitos'
+          curl -fsS --user default: 'http://127.0.0.1:8123/' --data-binary 'CREATE DATABASE IF NOT EXISTS aitos'
       - name: Verify decision_fusion.py before pytest
         run: |
           set -euxo pipefail
