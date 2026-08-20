@@ -85,13 +85,7 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
     attention_explainer = AttentionExplainer(); attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
     trade_lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine, order_executor=order_executor, kernel=kernel, use_exchange_side_stops=use_exchange_side_stops)
     data_ingestion = DataIngestionService(exchange=exchange, event_bus=event_bus, symbols=symbols, kline_timeframe=kline_timeframe, repository=market_data_repository)
-    decision_journal = decision_journal_repository or DecisionJournalRepository(
-        host=os.getenv("CLICKHOUSE_HOST", "localhost"),
-        port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
-        username=os.getenv("CLICKHOUSE_USER", "default"),
-        password=os.getenv("CLICKHOUSE_PASSWORD", ""),
-        database=os.getenv("CLICKHOUSE_DATABASE", "aitos"),
-    )
+    decision_journal = decision_journal_repository or DecisionJournalRepository()
     journal = JournalSystem(event_bus=event_bus, repository=journal_repository, risk_engine=risk_engine, decision_repository=decision_journal)
     performance_evaluator = DecisionPerformanceEvaluator(decision_journal)
     policy_monitor = PolicyMonitorService(event_bus=event_bus)
