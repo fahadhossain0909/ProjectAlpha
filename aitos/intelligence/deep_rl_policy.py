@@ -79,7 +79,7 @@ class DeepValueRLScorer(RLPolicyScorer):
         predicted_reward = float(self._model.predict(_vectorize(context))[0])
         raw_score = 5.0 + max(-1.0, min(1.0, predicted_reward / self._reward_scale)) * 5.0
         confidence = min(1.0, self._n_samples_seen / self._min_samples)
-        return round(max(0.0, min(10.0, 5.0 + (raw_score - 5.0) * confidence)), 2
+        return round(max(0.0, min(10.0, 5.0 + (raw_score - 5.0) * confidence)), 2)
 
     def save_state(self, path: str | None = None) -> None:
         target = Path(path or self._state_path)
