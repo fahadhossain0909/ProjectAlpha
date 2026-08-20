@@ -5,7 +5,7 @@ It never promotes or rolls back a policy itself.
 """
 from __future__ import annotations
 from collections import deque
-from typing import Any, Dict, List
+from typing import Any, Dict
 from aitos.core.contracts import AITOSModule, Event, EventResponse, HealthStatus, ModuleStatus
 from aitos.eventbus.redis_bus import EventBus, Subscription
 from aitos.journal.policy_monitor import evaluate_policy_health
@@ -38,8 +38,13 @@ class PolicyMonitorService(AITOSModule):
         self._initialized = True
 
     async def health_check(self) -> HealthStatus:
-        return HealthStatus(module_id=self.module_id, status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,
-                            latency_ms=0.0, details={"active_version": self._active_version, "window_size": len(self._window), "last_health": self._last_health})
+        return HealthStatus(
+            module_id=self.module_id,
+            status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,
+            latency_ms=0.0,
+            last_event_time=None,
+            details={"active_version": self._active_version, "window_size": len(self._window), "last_health": self._last_health},
+        )
 
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
         if self._subscription: self._subscription.cancel(); self._subscription = None
