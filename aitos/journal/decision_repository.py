@@ -1,6 +1,7 @@
 """Persistent decision journal and outcome attribution store."""
 from __future__ import annotations
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -16,16 +17,21 @@ CREATE TABLE IF NOT EXISTS decision_journal (
  confidence Nullable(Float64), payload String, pnl Nullable(Float64), pnl_percent Nullable(Float64),
  risk_amount_usd Nullable(Float64), r_multiple Nullable(Float64), holding_seconds Nullable(Float64),
  exit_reason Nullable(String),
- evidence_contributions String DEFAULT '[]'
+evidence_contributions String DEFAULT '[]'
 ) ENGINE = MergeTree() PARTITION BY toYYYYMM(recorded_at) ORDER BY (decision_id, recorded_at)
 """
 class DecisionJournalRepository(AITOSModule):
- def __init__(self, host="localhost", port=8123, username="default", password="", database="aitos"):
+ def __init__(self, host=None, port=None, username=None, password=None, database=None):
+  host = host or os.getenv("CLICKHOUSE_HOST", "localhost")
+  port = int(port or os.getenv("CLICKHOUSE_PORT", "8123"))
+  username = username or os.getenv("CLICKHOUSE_USER", "default")
+  password = password if password is not None else os.getenv("CLICKHOUSE_PASSWORD", "")
+  database = database or os.getenv("CLICKHOUSE_DATABASE", "aitos")
   self._conn_params=dict(host=host,port=port,username=username,password=password,database=database); self._client=None; self._initialized=False; self._last_event_time=None
  @property
  def module_id(self): return "decision-journal-repository"
  @property
- def version(self): return "1.1.0"
+ def version(self): return "1.1.1"
  async def initialize(self, config):
   if self._initialized:return
   self._client=await clickhouse_connect.get_async_client(**self._conn_params); await self._client.command(CREATE_DECISION_JOURNAL)
