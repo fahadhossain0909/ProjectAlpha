@@ -1,7 +1,7 @@
 """Versioned model registry with explicit candidate/champion states."""
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Any
 import json
@@ -11,13 +11,13 @@ import json
 class ModelArtifact:
     name: str
     version: str
-    kind: str  # rl | strategy | risk | regime | other
-    status: str = "candidate"  # candidate | champion | rejected | archived
+    kind: str
+    status: str = "candidate"
     parent_version: str | None = None
     training_data_id: str | None = None
     metrics: dict[str, float] | None = None
     metadata: dict[str, Any] | None = None
-    created_at: datetime = datetime.now(timezone.utc)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -26,11 +26,9 @@ class ModelArtifact:
 
 
 class ModelRegistry:
-    """Filesystem-backed registry for auditable candidate/champion promotion.
+    """Filesystem-backed registry with explicit promotion and rollback history."""
 
-    This registry deliberately has no automatic live deployment capability.
-    Promotion is an explicit operation after validation.
-    """
+    VALID_STATUSES = {"candidate", "champion", "rejected", "archived"}
 
     def __init__(self, path: str = "models/registry.json") -> None:
         self.path = path
@@ -51,7 +49,7 @@ class ModelRegistry:
         os.replace(tmp, self.path)
 
     def register(self, artifact: ModelArtifact) -> ModelArtifact:
-        if artifact.status not in {"candidate", "champion", "rejected", "archived"}:
+        if artifact.status not in self.VALID_STATUSES:
             raise ValueError("invalid model status")
         rows = self._load()
         if any(r["name"] == artifact.name and r["version"] == artifact.version for r in rows):
