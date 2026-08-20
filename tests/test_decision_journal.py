@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -71,8 +72,7 @@ async def test_decision_snapshot_is_persisted_and_linked_to_trade(event_bus, ris
 
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
-    # Preserve the same opportunity/decision identity used by the snapshot.
-    opportunity.agent_consensus = {"decision_id": opportunity.opportunity_id}
+    opportunity = replace(opportunity, agent_consensus={"decision_id": opportunity.opportunity_id})
     trade = await lifecycle.submit_opportunity(opportunity, PortfolioState(equity_usd=10_000.0, peak_equity_usd=10_000.0))
 
     assert await _wait_for(lambda: len(repo.decisions) == 1)
