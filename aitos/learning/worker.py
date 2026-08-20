@@ -1,9 +1,8 @@
 """Durable continual-learning worker for historical backtest experiences.
 
-Paper/live trades already update the online scorer through the event-driven
-RLFeedbackLoop. This worker therefore replays persisted *backtest* outcomes,
-which makes historical learning durable without double-training paper/live
-experiences after a restart.
+Paper/live trades update the same persistent neural scorer through the event-driven
+feedback loop. The scorer serializes read-modify-write updates so historical and
+online learning cannot overwrite one another.
 """
 from __future__ import annotations
 
@@ -98,6 +97,7 @@ class ContinualLearningWorker:
 
     def run_once(self) -> int:
         rows = self._rows()
+        changed = False
         for row in rows:
             experience_id = str(row["experience_id"])
             if experience_id in self._processed:
@@ -105,10 +105,12 @@ class ContinualLearningWorker:
             features = self._numeric_features(row["features_json"])
             if not features:
                 continue
-            self.scorer.update(str(row["symbol"]), features, float(row["reward"] or 0.0))
+            self.scorer.update_and_persist(
+                str(row["symbol"]), features, float(row["reward"] or 0.0)
+            )
             self._processed.add(experience_id)
-        if rows:
-            self.scorer.save_state()
+            changed = True
+        if changed:
             self._save_state()
         return len(self._processed)
 
