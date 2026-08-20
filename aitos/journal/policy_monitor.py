@@ -1,7 +1,13 @@
-"""Monitor active policy performance and create rollback candidates."""
+"""Event-driven active policy performance monitoring.
+
+This layer consumes closed-trade outcomes, maintains a bounded rolling window,
+and emits a rollback recommendation only. It deliberately does not mutate
+active policy state.
+"""
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping
+from typing import Any, Deque, Dict, Mapping, Optional
 
 @dataclass(frozen=True)
 class PolicyHealth:
@@ -16,11 +22,33 @@ class PolicyHealth:
     def to_dict(self) -> Dict[str, Any]:
         return self.__dict__.copy()
 
-def evaluate_policy_health(version: str, outcomes: list[Mapping[str, Any]], *, baseline_avg_r: float, min_observations: int = 30, max_degradation: float = 0.20, min_avg_r: float = 0.0) -> PolicyHealth:
-    rs = [float(x["r_multiple"]) for x in outcomes if isinstance(x.get("r_multiple"), (int, float))]
-    wins = sum(1 for r in rs if r > 0)
-    avg = sum(rs) / len(rs) if rs else 0.0
-    degradation = (baseline_avg_r - avg) / abs(baseline_avg_r) if baseline_avg_r > 0 else 0.0
-    bad = len(rs) >= min_observations and (avg < min_avg_r or degradation >= max_degradation)
-    reason = "rollback_recommended" if bad else ("insufficient_observations" if len(rs) < min_observations else "policy_within_guardrails")
-    return PolicyHealth(version, len(rs), avg, wins / len(rs) if rs else 0.0, baseline_avg_r, degradation, bad, reason)
+class PolicyMonitor:
+    def __init__(self, version: str, *, baseline_avg_r: float, window_size: int = 100, min_observations: int = 30, max_degradation: float = 0.20, min_avg_r: float = 0.0) -> None:
+        self.version = version
+        self.baseline_avg_r = float(baseline_avg_r)
+        self.window_size = max(1, int(window_size))
+        self.min_observations = max(1, int(min_observations))
+        self.max_degradation = float(max_degradation)
+        self.min_avg_r = float(min_avg_r)
+        self._outcomes: Deque[float] = deque(maxlen=self.window_size)
+
+    def record_outcome(self, outcome: Mapping[str, Any]) -> PolicyHealth:
+        value = outcome.get("r_multiple")
+        if isinstance(value, (int, float)):
+            self._outcomes.append(float(value))
+        return self.health()
+
+    def health(self) -> PolicyHealth:
+        rs = list(self._outcomes)
+        avg = sum(rs) / len(rs) if rs else 0.0
+        win_rate = sum(1 for r in rs if r > 0) / len(rs) if rs else 0.0
+        degradation = ((self.baseline_avg_r - avg) / abs(self.baseline_avg_r)) if self.baseline_avg_r > 0 else 0.0
+        bad = len(rs) >= self.min_observations and (avg < self.min_avg_r or degradation >= self.max_degradation)
+        reason = "rollback_recommended" if bad else ("insufficient_observations" if len(rs) < self.min_observations else "policy_within_guardrails")
+        return PolicyHealth(self.version, len(rs), avg, win_rate, self.baseline_avg_r, degradation, bad, reason)
+
+    def reset(self, version: str, baseline_avg_r: Optional[float] = None) -> None:
+        self.version = version
+        if baseline_avg_r is not None:
+            self.baseline_avg_r = float(baseline_avg_r)
+        self._outcomes.clear()
