@@ -96,6 +96,33 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Storage controller: runs daily and keeps the VPS disk bounded.
+  # It never deletes protected decision/trade/risk/model tables; only the
+  # explicitly configured high-volume market-history tables are evictable.
+  # The backtest cache is also capped independently.
+  aitos-storage-maintenance:
+    build: .
+    container_name: aitos-storage-maintenance
+    command: ["python3", "-m", "aitos.storage.maintenance"]
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DB: aitos
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_STORAGE_BUDGET_GB: "100"
+      CLICKHOUSE_STORAGE_TARGET_GB: "90"
+      BACKTEST_CACHE_MAX_GB: "20"
+      BACKTEST_DATA_DIR: /data/backtest
+      STORAGE_MAINTENANCE_INTERVAL_SECONDS: "86400"
+      STORAGE_MAINTENANCE_DRY_RUN: "false"
+    volumes:
+      - aitos_backtest_data:/data/backtest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
   # LIVE TRADING -- real orders, real money. Requires BINANCE_API_KEY/
   # BINANCE_API_SECRET in .env, and needs an interactive terminal for its
   # startup confirmation (aitos/live_trading.py) -- run it with
@@ -128,3 +155,4 @@ volumes:
   aitos_clickhouse_data:
   aitos_neo4j_data:
   aitos_neo4j_logs:
+  aitos_backtest_data:
