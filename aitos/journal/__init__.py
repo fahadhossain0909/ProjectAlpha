@@ -4,6 +4,7 @@ from .models import DailyReview, JournalEntry, JournalEntryType, MonthlyReview, 
 from .performance_evaluator import DecisionPerformanceEvaluator, PerformanceReport, PerformanceSlice
 from .repository import JournalRepository
 from .reviews import daily_review, monthly_review, r_multiple, weekly_review
+from .shadow_policy import ShadowPolicyResult, evaluate_shadow
 
 __all__ = [
     "JournalSystem",
@@ -14,6 +15,8 @@ __all__ = [
     "DecisionPerformanceEvaluator",
     "PerformanceReport",
     "PerformanceSlice",
+    "ShadowPolicyResult",
+    "evaluate_shadow",
     "JournalEntry",
     "JournalEntryType",
     "DailyReview",
