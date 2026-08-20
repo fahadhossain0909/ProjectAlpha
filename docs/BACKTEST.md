@@ -30,10 +30,13 @@ This does **not** start paper trading.
 
 ## 3. Run a backtest while paper trading is running
 
-Paper trading does not need to be stopped for this isolated service.
+Paper trading does not need to be stopped for this isolated service. Use the
+full command below because `docker compose run` replaces the service command
+with the command supplied after the service name.
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
+  python3 -m aitos.backtest.cli \
   --data /data/events.jsonl \
   --strategy aitos.backtest.cli:buy_and_hold \
   --initial-cash 10000 \
@@ -45,6 +48,7 @@ For a Parquet dataset:
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
+  python3 -m aitos.backtest.cli \
   --data /data/events.parquet \
   --format parquet \
   --strategy aitos.backtest.cli:buy_and_hold
@@ -68,6 +72,7 @@ Pass it as `module:function`, for example:
 
 ```bash
 docker compose --profile backtest run --rm aitos-backtest \
+  python3 -m aitos.backtest.cli \
   --data /data/events.jsonl \
   --strategy my_strategy:strategy
 ```
