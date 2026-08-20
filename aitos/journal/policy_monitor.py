@@ -1,9 +1,4 @@
-"""Event-driven active policy performance monitoring.
-
-This layer consumes closed-trade outcomes, maintains a bounded rolling window,
-and emits a rollback recommendation only. It deliberately does not mutate
-active policy state.
-"""
+"""Event-driven active policy performance monitoring."""
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
@@ -52,3 +47,10 @@ class PolicyMonitor:
         if baseline_avg_r is not None:
             self.baseline_avg_r = float(baseline_avg_r)
         self._outcomes.clear()
+
+def evaluate_policy_health(version: str, outcomes: list[Mapping[str, Any]], *, baseline_avg_r: float, min_observations: int = 30, max_degradation: float = 0.20, min_avg_r: float = 0.0) -> PolicyHealth:
+    """Compatibility helper for batch evaluation and existing callers."""
+    monitor = PolicyMonitor(version, baseline_avg_r=baseline_avg_r, min_observations=min_observations, max_degradation=max_degradation, min_avg_r=min_avg_r, window_size=max(1, len(outcomes)))
+    for outcome in outcomes:
+        monitor.record_outcome(outcome)
+    return monitor.health()
