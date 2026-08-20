@@ -1,5 +1,6 @@
 from .adaptive_policy import AdaptivePolicyEngine, PolicyCandidate, RegimePolicy
 from .evidence_attribution import DecisionEvidenceAttributor, EvidencePerformance
+from .evidence_weight_optimizer import EvidenceWeightCandidate, EvidenceWeightOptimizer
 from .journal_system import JournalSystem
 from .models import DailyReview, JournalEntry, JournalEntryType, MonthlyReview, WeeklyReview
 from .performance_evaluator import DecisionPerformanceEvaluator, PerformanceReport, PerformanceSlice
@@ -15,6 +16,8 @@ __all__ = [
     "RegimePolicy",
     "DecisionEvidenceAttributor",
     "EvidencePerformance",
+    "EvidenceWeightCandidate",
+    "EvidenceWeightOptimizer",
     "DecisionPerformanceEvaluator",
     "PerformanceReport",
     "PerformanceSlice",
