@@ -96,6 +96,21 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Historical backtesting -- opt-in only. It is deliberately independent
+  # from aitos-paper and reads historical data from /data in read-only mode.
+  # Resource limits reduce the chance that a large replay starves the paper bot.
+  aitos-backtest:
+    build: .
+    command: ["python3", "-m", "aitos.backtest.cli"]
+    volumes:
+      - ${BACKTEST_DATA_DIR:-./data}:/data:ro
+    environment:
+      PYTHONUNBUFFERED: "1"
+    cpus: "2.0"
+    mem_limit: 3g
+    restart: "no"
+    profiles: ["backtest"]
+
   # LIVE TRADING -- real orders, real money. Requires BINANCE_API_KEY/
   # BINANCE_API_SECRET in .env, and needs an interactive terminal for its
   # startup confirmation (aitos/live_trading.py) -- run it with
