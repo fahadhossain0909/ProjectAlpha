@@ -1,5 +1,6 @@
 """AI Kernel — central orchestrator of AITOS."""
 from __future__ import annotations
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -7,7 +8,8 @@ from aitos.agents.base_agent import BaseAgent
 from aitos.core.contracts import AITOSModule, Event, EventResponse, HealthStatus, ModuleStatus
 from aitos.core.exceptions import AgentNotRegisteredError, DecisionFusionError, GovernanceViolationError, ModuleNotInitializedError
 from aitos.eventbus.redis_bus import EventBus
-from aitos.kernel.decision_fusion import DecisionFusionEngine
+from aitos.kernel.decision_fusion import DEFAULT_EVIDENCE_WEIGHTS, DecisionFusionEngine
+from aitos.journal.policy_registry import PolicyRegistry
 from aitos.logging_setup import get_logger
 logger=get_logger("aitos.kernel")
 
@@ -29,11 +31,14 @@ class GovernanceResult:
  approved:bool; reason:str; requires_human_approval:bool
 
 class AIKernel(AITOSModule):
- def __init__(self,event_bus:EventBus,require_human_approval_for_prod=True,fusion_engine=None): self._event_bus=event_bus; self._require_human_approval_for_prod=require_human_approval_for_prod; self._fusion_engine=fusion_engine or DecisionFusionEngine(); self._initialized=False; self._agents={}; self._world_state=WorldState(); self._last_event_time=None; self._policy_version="baseline"
+ def __init__(self,event_bus:EventBus,require_human_approval_for_prod=True,fusion_engine=None,policy_registry=None):
+  self._event_bus=event_bus; self._require_human_approval_for_prod=require_human_approval_for_prod
+  self._fusion_engine=fusion_engine or DecisionFusionEngine(); self._policy_registry=policy_registry or PolicyRegistry(os.getenv("AITOS_ACTIVE_POLICY_PATH","runtime/active_policy.json"),DEFAULT_EVIDENCE_WEIGHTS)
+  self._initialized=False; self._agents={}; self._world_state=WorldState(); self._last_event_time=None; self._policy_version="baseline"
  @property
  def module_id(self): return "ai-kernel"
  @property
- def version(self): return "1.3.0"
+ def version(self): return "1.4.0"
  @property
  def fusion_min_confidence(self): return self._fusion_engine.min_confidence
  @property
@@ -42,19 +47,28 @@ class AIKernel(AITOSModule):
  def fusion_weights(self): return self._fusion_engine.weights
  async def initialize(self,config):
   if self._initialized:return
-  self._initialized=True; logger.info("AIKernel initialized",extra={"aitos_extra":{"policy_version":self._policy_version}})
+  self._initialized=True
+  self.reload_active_policy()
+  logger.info("AIKernel initialized",extra={"aitos_extra":{"policy_version":self._policy_version}})
+ def reload_active_policy(self):
+  """Atomically load the persisted active policy into the live fusion engine."""
+  policy=self._policy_registry.active
+  self._fusion_engine=DecisionFusionEngine(weights=policy.weights,min_confidence=policy.min_confidence)
+  self._policy_version=policy.version
+  return policy
  def apply_policy(self, policy)->None:
-  """Atomically replace the in-memory fusion engine with a validated policy."""
   if not self._initialized: raise ModuleNotInitializedError("AIKernel.initialize() must be called first")
-  self._fusion_engine = DecisionFusionEngine(weights=policy.weights, min_confidence=policy.min_confidence)
-  self._policy_version = policy.version
+  self._fusion_engine=DecisionFusionEngine(weights=policy.weights,min_confidence=policy.min_confidence); self._policy_version=policy.version
   logger.info("AIKernel policy activated",extra={"aitos_extra":{"policy_version":policy.version,"weights":policy.weights,"min_confidence":policy.min_confidence}})
  async def health_check(self): return HealthStatus(module_id=self.module_id,status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,latency_ms=0.0,last_event_time=self._last_event_time,details={"registered_agents":list(self._agents.keys()),"fusion_min_confidence":self.fusion_min_confidence,"policy_version":self._policy_version})
  async def shutdown(self,grace_period_seconds=30.0):
   for agent in list(self._agents.values()): await agent.shutdown(grace_period_seconds)
   self._agents.clear(); logger.info("AIKernel shut down")
  async def emit_events(self)->AsyncIterator[Event]: return; yield
- async def handle_event(self,event:Event)->Optional[EventResponse]: self._last_event_time=datetime.now(timezone.utc).isoformat(); self._update_world_state_from_event(event); [await agent.handle_event(event) for agent in self._agents.values()]; return None
+ async def handle_event(self,event:Event)->Optional[EventResponse]:
+  self._last_event_time=datetime.now(timezone.utc).isoformat()
+  if event.topic=="policy.activate": self.reload_active_policy(); return None
+  self._update_world_state_from_event(event); [await agent.handle_event(event) for agent in self._agents.values()]; return None
  async def register_agent(self,agent:BaseAgent): self._require_initialized(); self._agents[agent.module_id]=agent; self._world_state.registered_agents=list(self._agents.keys())
  async def deregister_agent(self,agent_id):
   self._require_initialized()
