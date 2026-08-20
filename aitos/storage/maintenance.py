@@ -37,6 +37,8 @@ PROTECTED_TABLE_TOKENS = (
     "experience", "journal", "strategy", "execution", "portfolio",
 )
 
+PROTECTED_CACHE_NAMES = {"manifest.json", "download_manifest.json", ".gitkeep"}
+
 
 @dataclass(frozen=True)
 class StorageConfig:
@@ -66,11 +68,11 @@ def _protected(table: str) -> bool:
     return any(token in name for token in PROTECTED_TABLE_TOKENS)
 
 
-def _candidate_days(current_gb: float, target_gb: float, estimated_daily_gb: float) -> int:
-    if current_gb <= target_gb or estimated_daily_gb <= 0:
+def _candidate_days(current_gb: float, target_gb: float, evictable_daily_gb: float) -> int:
+    if current_gb <= target_gb or evictable_daily_gb <= 0:
         return RETENTION_LADDER[0]
     for days in RETENTION_LADDER:
-        if estimated_daily_gb * days <= target_gb:
+        if evictable_daily_gb * days <= target_gb:
             return days
     return RETENTION_LADDER[-1]
 
@@ -99,17 +101,25 @@ def enforce_clickhouse(client, config: StorageConfig, database: str = DEFAULT_DB
     total_bytes = sum(row[1] for row in inventory)
     evictable = [row for row in inventory if row[0] in EVICTABLE_TABLES and not _protected(row[0])]
     evictable_bytes = sum(row[1] for row in evictable)
+    protected_bytes = max(0, total_bytes - evictable_bytes)
 
     if not evictable:
         return {"total_gb": _gb(total_bytes), "retention_days": 90, "evicted": [], "reason": "no configured evictable tables"}
 
-    # Estimate recent daily footprint from each table's observed time span.
+    # Estimate the observed daily footprint of evictable tables.
     daily_bytes = 0.0
-    for table, size, min_time, max_time in evictable:
+    for _table, size, min_time, max_time in evictable:
         if min_time and max_time:
             span_days = max(1.0, (max_time - min_time).total_seconds() / 86400.0)
             daily_bytes += size / span_days
-    retention = choose_retention_days(_gb(total_bytes), config.clickhouse_target_gb, _gb(daily_bytes))
+
+    target_bytes = config.clickhouse_target_gb * (1024 ** 3)
+    remaining_evictable_budget = max(0.0, target_bytes - protected_bytes)
+    retention = _candidate_days(
+        _gb(evictable_bytes),
+        _gb(remaining_evictable_budget),
+        _gb(daily_bytes),
+    )
 
     evicted: list[str] = []
     if _gb(total_bytes) > config.clickhouse_target_gb:
@@ -123,10 +133,12 @@ def enforce_clickhouse(client, config: StorageConfig, database: str = DEFAULT_DB
 
     return {
         "total_gb": _gb(total_bytes),
+        "protected_gb": _gb(protected_bytes),
         "evictable_gb": _gb(evictable_bytes),
         "retention_days": retention,
         "evicted": evicted,
         "dry_run": config.dry_run,
+        "protected_data_exceeds_target": protected_bytes > target_bytes,
     }
 
 
@@ -137,7 +149,8 @@ def _files(root: Path) -> Iterable[Path]:
 
 
 def enforce_backtest_cache(root: Path, max_gb: float, dry_run: bool = False) -> dict:
-    files = sorted(_files(root), key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    files = [p for p in _files(root) if p.name not in PROTECTED_CACHE_NAMES]
+    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
     total = sum(p.stat().st_size for p in files if p.exists())
     removed: list[str] = []
     limit = max_gb * (1024 ** 3)
