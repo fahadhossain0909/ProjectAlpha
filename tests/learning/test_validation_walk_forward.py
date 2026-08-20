@@ -7,13 +7,13 @@ from aitos.learning.validation import CandidateValidator, ValidationPolicy
 def _events(days=250):
     base = datetime(2025, 1, 1, tzinfo=timezone.utc)
     return [
-        SimpleNamespace(timestamp=base + timedelta(days=i), value=float(i + 1))
+        SimpleNamespace(timestamp=base + timedelta(days=i), value=float(i + 1), fields={})
         for i in range(days)
     ]
 
 
-def _strategy(event):
-    return {"action": "hold"}
+def _strategy(event, execution):
+    return None
 
 
 def _mark_price(event):
@@ -54,4 +54,4 @@ def test_walk_forward_rejects_insufficient_history():
     )
     result = validator.evaluate(_events(20), _strategy, _mark_price)
     assert not result.passed
-    assert result.walk_forward is not None or "walk-forward" in result.reason
+    assert "walk-forward" in result.reason
