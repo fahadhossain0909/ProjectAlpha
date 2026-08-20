@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import clickhouse_connect
@@ -76,13 +77,8 @@ class DecisionJournalRepository(AITOSModule):
         except Exception as exc:  # noqa: BLE001
             status = ModuleStatus.UNHEALTHY
             logger.error("decision journal health check failed: %s", exc)
-        return HealthStatus(
-            module_id=self.module_id,
-            status=status,
-            latency_ms=(time.monotonic() - start) * 1000,
-            last_event_time=self._last_event_time,
-            details={},
-        )
+        return HealthStatus(module_id=self.module_id, status=status,
+            latency_ms=(time.monotonic() - start) * 1000, last_event_time=self._last_event_time, details={})
 
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
         if self._client is not None:
@@ -98,55 +94,29 @@ class DecisionJournalRepository(AITOSModule):
 
     async def save_decision(self, decision_id: str, snapshot: Dict[str, Any]) -> None:
         self._require_initialized()
-        await self._insert(
-            record_type="DECISION",
-            decision_id=decision_id,
-            trade_id=None,
-            symbol=str(snapshot.get("symbol", "")),
-            side=str(snapshot.get("side", "")),
-            strategy_id=str(snapshot.get("strategy_id", "")),
-            regime=str(snapshot.get("regime", "unknown")),
-            confidence=snapshot.get("confidence"),
-            payload=snapshot,
-        )
+        await self._insert(record_type="DECISION", decision_id=decision_id, trade_id=None,
+            symbol=str(snapshot.get("symbol", "")), side=str(snapshot.get("side", "")),
+            strategy_id=str(snapshot.get("strategy_id", "")), regime=str(snapshot.get("regime", "unknown")),
+            confidence=snapshot.get("confidence"), payload=snapshot)
 
     async def link_trade(self, decision_id: str, trade: Dict[str, Any]) -> None:
         self._require_initialized()
-        await self._insert(
-            record_type="TRADE_LINK",
-            decision_id=decision_id,
-            trade_id=trade.get("trade_id"),
-            symbol=str(trade.get("symbol", "")),
-            side=str(trade.get("side", "")),
-            strategy_id=str(trade.get("strategy_id", "")),
-            regime=str(trade.get("regime", "unknown")),
-            confidence=None,
-            payload=trade,
-        )
+        await self._insert(record_type="TRADE_LINK", decision_id=decision_id, trade_id=trade.get("trade_id"),
+            symbol=str(trade.get("symbol", "")), side=str(trade.get("side", "")),
+            strategy_id=str(trade.get("strategy_id", "")), regime=str(trade.get("regime", "unknown")),
+            confidence=None, payload=trade)
 
     async def attribute_outcome(self, decision_id: str, trade: Dict[str, Any]) -> None:
         self._require_initialized()
-        pnl = trade.get("pnl")
-        risk = trade.get("risk_amount_usd")
+        pnl = trade.get("pnl"); risk = trade.get("risk_amount_usd")
         r_multiple = (float(pnl) / float(risk)) if pnl is not None and risk not in (None, 0, 0.0) else None
         holding_seconds = self._holding_seconds(trade.get("entry_time"), trade.get("exit_time"))
-        await self._insert(
-            record_type="OUTCOME",
-            decision_id=decision_id,
-            trade_id=trade.get("trade_id"),
-            symbol=str(trade.get("symbol", "")),
-            side=str(trade.get("side", "")),
-            strategy_id=str(trade.get("strategy_id", "")),
-            regime=str(trade.get("regime", "unknown")),
-            confidence=None,
-            payload=trade,
-            pnl=pnl,
-            pnl_percent=trade.get("pnl_percent"),
-            risk_amount_usd=risk,
-            r_multiple=r_multiple,
-            holding_seconds=holding_seconds,
-            exit_reason=trade.get("exit_reason"),
-        )
+        await self._insert(record_type="OUTCOME", decision_id=decision_id, trade_id=trade.get("trade_id"),
+            symbol=str(trade.get("symbol", "")), side=str(trade.get("side", "")),
+            strategy_id=str(trade.get("strategy_id", "")), regime=str(trade.get("regime", "unknown")),
+            confidence=None, payload=trade, pnl=pnl, pnl_percent=trade.get("pnl_percent"),
+            risk_amount_usd=risk, r_multiple=r_multiple, holding_seconds=holding_seconds,
+            exit_reason=trade.get("exit_reason"))
 
     async def get_records(self, decision_id: str) -> List[Dict[str, Any]]:
         self._require_initialized()
@@ -161,22 +131,20 @@ class DecisionJournalRepository(AITOSModule):
                       pnl: Optional[float] = None, pnl_percent: Optional[float] = None,
                       risk_amount_usd: Optional[float] = None, r_multiple: Optional[float] = None,
                       holding_seconds: Optional[float] = None, exit_reason: Optional[str] = None) -> None:
+        recorded_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await self._client.insert(
             "decision_journal",
-            [[trade_id, decision_id, record_type, symbol, side, strategy_id, regime, confidence,
-              json.dumps(payload, default=str), pnl, pnl_percent, risk_amount_usd, r_multiple,
-              holding_seconds, exit_reason]],
-            column_names=["trade_id", "decision_id", "record_type", "symbol", "side", "strategy_id", "regime",
-                          "confidence", "payload", "pnl", "pnl_percent", "risk_amount_usd", "r_multiple",
-                          "holding_seconds", "exit_reason"],
+            [[recorded_at, decision_id, record_type, trade_id, symbol, side, strategy_id, regime, confidence,
+              json.dumps(payload, default=str), pnl, pnl_percent, risk_amount_usd, r_multiple, holding_seconds, exit_reason]],
+            column_names=["recorded_at", "decision_id", "record_type", "trade_id", "symbol", "side", "strategy_id", "regime",
+                          "confidence", "payload", "pnl", "pnl_percent", "risk_amount_usd", "r_multiple", "holding_seconds", "exit_reason"],
         )
-        self._last_event_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._last_event_time = recorded_at.isoformat()
 
     @staticmethod
     def _holding_seconds(entry_time: Optional[str], exit_time: Optional[str]) -> Optional[float]:
         if not entry_time or not exit_time:
             return None
-        from datetime import datetime
         try:
             return max(0.0, (datetime.fromisoformat(exit_time) - datetime.fromisoformat(entry_time)).total_seconds())
         except (TypeError, ValueError):
