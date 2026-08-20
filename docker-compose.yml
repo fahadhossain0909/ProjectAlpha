@@ -96,7 +96,6 @@ services:
   # Resource limits prevent a large replay from starving a running paper bot.
   aitos-backtest:
     build: .
-    container_name: aitos-backtest
     command: ["python3", "-m", "aitos.backtest.cli"]
     volumes:
       - ${BACKTEST_DATA_DIR:-./data}:/data:ro
