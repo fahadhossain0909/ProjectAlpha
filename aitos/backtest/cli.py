@@ -1,18 +1,13 @@
 """CLI for canonical ProjectAlpha historical backtests."""
 from __future__ import annotations
-
-import argparse
-import importlib
-import json
+import argparse, importlib, json, os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
-
 from .engine import BacktestEngine
 from aitos.learning.experience import ExperienceRecord
 from aitos.learning.clickhouse_store import ClickHouseExperienceStore
-
 
 @dataclass(frozen=True)
 class HistoricalEvent:
@@ -23,20 +18,16 @@ class HistoricalEvent:
         try: return self.fields[name]
         except KeyError as exc: raise AttributeError(name) from exc
 
-
 def _timestamp(value: Any) -> datetime:
     if isinstance(value, datetime): dt = value
     elif isinstance(value, (int, float)):
-        seconds = float(value) / 1000.0 if abs(float(value)) > 10_000_000_000 else float(value)
-        dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        seconds = float(value) / 1000.0 if abs(float(value)) > 10_000_000_000 else float(value); dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
     else: dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
 
 def _event(row: dict[str, Any]) -> HistoricalEvent:
     if "timestamp" not in row or "price" not in row: raise ValueError("Each historical row must contain 'timestamp' and 'price'")
     return HistoricalEvent(_timestamp(row["timestamp"]), float(row["price"]), row)
-
 
 def read_events(path: str | Path, fmt: str = "auto") -> Iterator[HistoricalEvent]:
     source = Path(path)
@@ -51,12 +42,10 @@ def read_events(path: str | Path, fmt: str = "auto") -> Iterator[HistoricalEvent
     if fmt == "parquet":
         try: import pyarrow.dataset as ds
         except ImportError as exc: raise RuntimeError("Parquet input requires pyarrow") from exc
-        dataset = ds.dataset(str(source), format="parquet", partitioning="hive")
-        for batch in dataset.scanner(batch_size=50_000).to_batches():
+        for batch in ds.dataset(str(source), format="parquet", partitioning="hive").scanner(batch_size=50_000).to_batches():
             for row in batch.to_pylist(): yield _event(row)
         return
     raise ValueError(f"Unsupported input format: {fmt}")
-
 
 def load_strategy(spec: str) -> Callable[[Any, Any], None]:
     module_name, separator, attr = spec.partition(":")
@@ -66,38 +55,23 @@ def load_strategy(spec: str) -> Callable[[Any, Any], None]:
     if not callable(strategy): raise TypeError(f"Strategy is not callable: {spec}")
     return strategy
 
-
 def buy_and_hold(event: Any, execution: Any) -> None:
     if not getattr(execution, "_cli_bought", False): execution.execute("buy", 1.0, float(event.price)); execution._cli_bought = True
 
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a canonical ProjectAlpha historical backtest")
-    parser.add_argument("--data", help="JSONL or Parquet file/dataset when --source=file")
-    parser.add_argument("--source", choices=("file", "clickhouse"), default="file")
-    parser.add_argument("--format", choices=("auto", "jsonl", "parquet"), default="auto")
-    parser.add_argument("--strategy", default="aitos.backtest.cli:buy_and_hold")
-    parser.add_argument("--initial-cash", type=float, default=10_000.0)
-    parser.add_argument("--fee-rate", type=float, default=0.0004)
-    parser.add_argument("--slippage-bps", type=float, default=0.0)
-    parser.add_argument("--symbol", default=None)
-    parser.add_argument("--table", choices=("ohlcv", "trades", "orderbook"), default="ohlcv")
-    parser.add_argument("--timeframe", default="15m")
-    parser.add_argument("--start", default=None); parser.add_argument("--end", default=None)
-    parser.add_argument("--clickhouse-host", default="localhost"); parser.add_argument("--clickhouse-port", type=int, default=8123)
-    parser.add_argument("--clickhouse-user", default="default"); parser.add_argument("--clickhouse-password", default=""); parser.add_argument("--clickhouse-db", default="aitos")
-    parser.add_argument("--persist-learning", action="store_true", help="append a backtest summary to learning_experiences")
+    parser.add_argument("--data"); parser.add_argument("--source", choices=("file", "clickhouse"), default="file"); parser.add_argument("--format", choices=("auto", "jsonl", "parquet"), default="auto")
+    parser.add_argument("--strategy", default="aitos.backtest.cli:buy_and_hold"); parser.add_argument("--initial-cash", type=float, default=10_000.0); parser.add_argument("--fee-rate", type=float, default=0.0004); parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument("--symbol", default=None); parser.add_argument("--table", choices=("ohlcv", "trades", "orderbook"), default="ohlcv"); parser.add_argument("--timeframe", default="15m"); parser.add_argument("--start"); parser.add_argument("--end")
+    parser.add_argument("--clickhouse-host", default=os.getenv("CLICKHOUSE_HOST", "localhost")); parser.add_argument("--clickhouse-port", type=int, default=int(os.getenv("CLICKHOUSE_PORT", "8123"))); parser.add_argument("--clickhouse-user", default=os.getenv("CLICKHOUSE_USER", "default")); parser.add_argument("--clickhouse-password", default=os.getenv("CLICKHOUSE_PASSWORD", "")); parser.add_argument("--clickhouse-db", default=os.getenv("CLICKHOUSE_DB", "aitos"))
+    parser.add_argument("--persist-learning", action="store_true")
     return parser
-
 
 def _persist_summary(args, result) -> None:
     import clickhouse_connect
     client = clickhouse_connect.get_client(host=args.clickhouse_host, port=args.clickhouse_port, username=args.clickhouse_user, password=args.clickhouse_password, database=args.clickhouse_db)
-    store = ClickHouseExperienceStore(client, args.clickhouse_db); store.ensure_schema()
-    m = result.metrics
-    record = ExperienceRecord(timestamp=datetime.now(timezone.utc), source="backtest", symbol=args.symbol or "unknown", decision="backtest_summary", outcome="completed", reward=m.total_return, confidence=1.0, strategy_version=args.strategy, metadata={"initial_equity": m.initial_equity, "final_equity": m.final_equity, "max_drawdown": m.max_drawdown, "sharpe": m.sharpe, "trades": m.trades, "wins": m.wins, "losses": m.losses, "win_rate": m.win_rate, "profit_factor": m.profit_factor})
-    store.append([record]); client.close()
-
+    store = ClickHouseExperienceStore(client, args.clickhouse_db); store.ensure_schema(); m = result.metrics
+    store.append([ExperienceRecord(timestamp=datetime.now(timezone.utc), source="backtest", symbol=args.symbol or "unknown", decision="backtest_summary", outcome="completed", reward=m.total_return, confidence=1.0, strategy_version=args.strategy, metadata={"initial_equity": m.initial_equity, "final_equity": m.final_equity, "max_drawdown": m.max_drawdown, "sharpe": m.sharpe, "trades": m.trades, "wins": m.wins, "losses": m.losses, "win_rate": m.win_rate, "profit_factor": m.profit_factor})]); client.close()
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv); strategy = load_strategy(args.strategy); source = None
@@ -107,15 +81,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if not args.symbol: raise SystemExit("--symbol is required when --source=clickhouse")
         from .clickhouse_source import ClickHouseHistoricalSource, parse_optional_time
-        source = ClickHouseHistoricalSource(args.clickhouse_host, args.clickhouse_port, args.clickhouse_user, args.clickhouse_password, args.clickhouse_db)
-        events = source.events(args.symbol, parse_optional_time(args.start), parse_optional_time(args.end), args.table, args.timeframe)
+        source = ClickHouseHistoricalSource(args.clickhouse_host, args.clickhouse_port, args.clickhouse_user, args.clickhouse_password, args.clickhouse_db); events = source.events(args.symbol, parse_optional_time(args.start), parse_optional_time(args.end), args.table, args.timeframe)
     try: result = BacktestEngine(initial_cash=args.initial_cash, fee_rate=args.fee_rate, slippage_bps=args.slippage_bps).run(events, strategy, lambda event: float(event.price))
     finally:
         if source is not None: source.close()
     if args.persist_learning: _persist_summary(args, result)
     m = result.metrics
-    print(json.dumps({"source": args.source, "symbol": args.symbol, "strategy": args.strategy, "events": len(result.equity_curve), "initial_equity": m.initial_equity, "final_equity": m.final_equity, "total_return": m.total_return, "max_drawdown": m.max_drawdown, "sharpe": m.sharpe, "total_fees": m.total_fees, "trades": m.trades, "wins": m.wins, "losses": m.losses, "win_rate": m.win_rate, "profit_factor": m.profit_factor}, indent=2, allow_nan=True))
-    return 0
-
+    print(json.dumps({"source": args.source, "symbol": args.symbol, "strategy": args.strategy, "events": len(result.equity_curve), "initial_equity": m.initial_equity, "final_equity": m.final_equity, "total_return": m.total_return, "max_drawdown": m.max_drawdown, "sharpe": m.sharpe, "total_fees": m.total_fees, "trades": m.trades, "wins": m.wins, "losses": m.losses, "win_rate": m.win_rate, "profit_factor": m.profit_factor}, indent=2, allow_nan=True)); return 0
 
 if __name__ == "__main__": raise SystemExit(main())
