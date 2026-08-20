@@ -2,10 +2,10 @@
 
 ## Goals
 
-- ClickHouse is the long-term source of truth for data that the trading system can regenerate from its own live/paper history.
-- Backtest downloads are a bounded cache, not an ever-growing archive.
+- ClickHouse is the primary long-term source for historical market data that the system has retained from its live/paper operation.
+- Backtest downloads are a bounded, re-downloadable cache, not an ever-growing archive.
 - Trade/decision/risk/model/experience data is protected from automatic deletion.
-- High-volume market-history data such as L2/order-book data is evictable and can be re-downloaded when absent.
+- High-volume market-history data such as L2/order-book data is evictable and can be downloaded again when absent.
 - The default VPS ClickHouse budget is **100 GiB**, with a **90 GiB target** so cleanup has headroom.
 - The backtest download cache is capped at **20 GiB** by default.
 
@@ -46,25 +46,42 @@ This distinction matters: **GiB here means disk/storage capacity, not RAM.** Cli
 
 ## Backtest download cache
 
-The cache is mounted at `/data/backtest` and capped at 20 GiB. When it exceeds the cap, the oldest files are removed first. The downloader's manifest remains outside the eviction loop only when it is stored outside the cache; if the manifest is inside the cache, it should be treated as metadata and kept in a small dedicated directory in a later hardening pass.
+The cache is mounted at `/data/backtest` and capped at 20 GiB. When it exceeds the cap, the oldest files are removed first. The cache is disposable: if a required historical partition is no longer present locally, the downloader can fetch it again.
 
-When a required historical partition is absent locally, the downloader may fetch it again. This is intentional: the local directory is a cache, not the authoritative archive.
+Downloaded Parquet files are used **directly by the backtest engine**. They are **not ingested into ClickHouse** and are not treated as a second long-term database.
 
-## ClickHouse-first rule
+## ClickHouse-first backtest rule
 
-The long-term target architecture is:
+The intended resolver order is:
 
 1. Query ClickHouse for the requested historical partition.
 2. If the required data is present and complete, backtest directly from ClickHouse.
-3. Only if it is absent, download the missing partition from the external source.
-4. Ingest the downloaded data into ClickHouse so the same request will not need another download later.
-5. The local downloaded file is retained only until the cache policy evicts it.
+3. Only if it is absent, download the missing partition from the external source as Parquet.
+4. Run the backtest directly from that Parquet dataset.
+5. Do **not** ingest the downloaded Parquet into ClickHouse.
 
-This prevents duplicate long-term storage of data that already lives in ClickHouse.
+This keeps ClickHouse storage bounded while still allowing old market history to be recovered from the external source when it has been evicted.
+
+```text
+Backtest request
+      |
+      v
+ClickHouse has requested data?
+      | yes                     | no
+      v                         v
+Read ClickHouse          Download Parquet
+      |                         |
+      |                         v
+      |                   Backtest from Parquet
+      |                         |
+      +-----------+-------------+
+                  v
+             Backtest result
+```
 
 ## Important current-repository limitation
 
-The repository already has a ClickHouse `MarketDataRepository` with `market_ohlcv`, `order_book_snapshots`, `trade_ticks`, `funding_rates` and `open_interest`, while the historical downloader currently writes canonical Parquet partitions. The final ClickHouse-first backtest resolver therefore must be connected to the actual historical ingestion path before it can truthfully claim that every downloaded dataset is automatically available from ClickHouse. This policy file deliberately does not pretend that connection already exists.
+The repository already has a ClickHouse `MarketDataRepository` with `market_ohlcv`, `order_book_snapshots`, `trade_ticks`, `funding_rates` and `open_interest`, while the historical downloader currently writes canonical Parquet partitions. The final ClickHouse-first backtest resolver therefore still needs to be connected to the actual backtest data-access path before the repository can truthfully claim that every backtest request automatically performs this fallback. This policy file deliberately does not pretend that connection already exists.
 
 ## Manual dry run
 
