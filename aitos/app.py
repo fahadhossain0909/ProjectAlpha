@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Protocol
 
-from aitos.core.contracts import AITOSModule
+from aitos.core.contracts import AITOSModule, Event
 from aitos.data.ingestion import DataIngestionService
 from aitos.data.repository import MarketDataRepository
 from aitos.eventbus.redis_bus import EventBus, Subscription
@@ -17,6 +17,7 @@ from aitos.execution.order_executor import OrderExecutor
 from aitos.intelligence.rl_feedback import RLFeedbackLoop
 from aitos.intelligence.rl_policy import RLPolicyScorer, TabularBanditRLScorer
 from aitos.intelligence.scanner import OpportunityScanner
+from aitos.journal.decision_repository import DecisionJournalRepository
 from aitos.journal.journal_system import JournalSystem
 from aitos.journal.repository import JournalRepository
 from aitos.kernel.ai_kernel import AIKernel
@@ -44,6 +45,7 @@ class SystemComponents:
     scanner: OpportunityScanner
     trade_lifecycle: TradeLifecycle
     journal: JournalSystem
+    decision_journal: DecisionJournalRepository
     rl_scorer: TabularBanditRLScorer
     rl_feedback: RLFeedbackLoop
     outcome_classifier: TradeOutcomeClassifier
@@ -54,8 +56,12 @@ class SystemComponents:
     knowledge_graph: Optional[KnowledgeGraphWriter] = None
     correlation_updater: Optional[SymbolCorrelationUpdater] = None
     _price_feed_subscriptions: List[Subscription] = field(default_factory=list)
+
     def all_modules(self) -> List[AITOSModule]:
-        modules: List[AITOSModule] = [self.event_bus, self.kernel, self.risk_engine, self.journal, self.rl_feedback, self.ml_feedback, self.attention_feedback]
+        modules: List[AITOSModule] = [
+            self.event_bus, self.kernel, self.risk_engine, self.decision_journal,
+            self.journal, self.rl_feedback, self.ml_feedback, self.attention_feedback,
+        ]
         if self.knowledge_graph is not None: modules.append(self.knowledge_graph)
         modules += [self.data_ingestion, self.scanner, self.trade_lifecycle]
         if self.reconciliation is not None: modules.append(self.reconciliation)
@@ -64,9 +70,10 @@ class SystemComponents:
 
 async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_executor: OrderExecutor, symbols: List[str],
                        kline_timeframe: str = "15m", scanner_timeframe: str = "15m", market_data_repository: Optional[MarketDataRepository] = None,
-                       journal_repository: Optional[JournalRepository] = None, graph_driver: Optional[GraphDriver] = None,
-                       risk_limits: Optional[RiskLimits] = None, kernel: Optional[AIKernel] = None, rl_scorer: Optional[RLPolicyScorer] = None,
-                       use_exchange_side_stops: bool = False, min_score_threshold: float = 60.0, top_n: int = 5) -> SystemComponents:
+                       journal_repository: Optional[JournalRepository] = None, decision_journal_repository: Optional[DecisionJournalRepository] = None,
+                       graph_driver: Optional[GraphDriver] = None, risk_limits: Optional[RiskLimits] = None, kernel: Optional[AIKernel] = None,
+                       rl_scorer: Optional[RLPolicyScorer] = None, use_exchange_side_stops: bool = False,
+                       min_score_threshold: float = 60.0, top_n: int = 5) -> SystemComponents:
     kernel = kernel or AIKernel(event_bus=event_bus)
     risk_engine = RiskEngine(event_bus=event_bus, limits=risk_limits)
     rl_scorer = rl_scorer or TabularBanditRLScorer()
@@ -77,15 +84,17 @@ async def build_system(event_bus: EventBus, exchange: ExchangeAdapter, order_exe
     attention_explainer = AttentionExplainer(); attention_feedback = AttentionFeedbackLoop(event_bus=event_bus, explainer=attention_explainer)
     trade_lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine, order_executor=order_executor, kernel=kernel, use_exchange_side_stops=use_exchange_side_stops)
     data_ingestion = DataIngestionService(exchange=exchange, event_bus=event_bus, symbols=symbols, kline_timeframe=kline_timeframe, repository=market_data_repository)
-    journal = JournalSystem(event_bus=event_bus, repository=journal_repository, risk_engine=risk_engine)
+    decision_journal = decision_journal_repository or DecisionJournalRepository()
+    journal = JournalSystem(event_bus=event_bus, repository=journal_repository, risk_engine=risk_engine, decision_repository=decision_journal)
     reconciliation = ReconciliationScheduler(trade_lifecycle=trade_lifecycle, event_bus=event_bus) if order_executor.supports_exchange_side_stops and use_exchange_side_stops else None
     knowledge_graph = correlation_updater = None
     if graph_driver is not None:
         knowledge_graph = KnowledgeGraphWriter(event_bus=event_bus, driver=graph_driver)
         correlation_updater = SymbolCorrelationUpdater(exchange=exchange, graph_writer=knowledge_graph, symbols=symbols, timeframe=scanner_timeframe)
     return SystemComponents(event_bus=event_bus, kernel=kernel, risk_engine=risk_engine, data_ingestion=data_ingestion, scanner=scanner,
-        trade_lifecycle=trade_lifecycle, journal=journal, rl_scorer=rl_scorer, rl_feedback=rl_feedback, outcome_classifier=outcome_classifier,
-        ml_feedback=ml_feedback, attention_explainer=attention_explainer, attention_feedback=attention_feedback,
+        trade_lifecycle=trade_lifecycle, journal=journal, decision_journal=decision_journal, rl_scorer=rl_scorer,
+        rl_feedback=rl_feedback, outcome_classifier=outcome_classifier, ml_feedback=ml_feedback,
+        attention_explainer=attention_explainer, attention_feedback=attention_feedback,
         reconciliation=reconciliation, knowledge_graph=knowledge_graph, correlation_updater=correlation_updater)
 
 async def _health_status(module: AITOSModule):
@@ -166,9 +175,32 @@ async def run_scan_and_trade_cycle(components: SystemComponents, portfolio_track
             logger.info("kernel vetoed candidate", extra={"aitos_extra": {"symbol": candidate.symbol, "scanner_direction": candidate.direction.value, "kernel_direction": decision.direction, "confidence": decision.confidence}})
             continue
         opportunity = components.scanner.to_opportunity(candidate, is_production=is_production, approved_by=approved_by)
+        decision_id = opportunity.opportunity_id
         opportunity = replace(opportunity, confidence=min(opportunity.confidence, decision.confidence),
             rationale=f"kernel_confidence={decision.confidence:.4f}; " + opportunity.rationale,
-            agent_consensus={**opportunity.agent_consensus, "kernel_fusion_confidence": decision.confidence})
+            agent_consensus={**opportunity.agent_consensus, "kernel_fusion_confidence": decision.confidence, "decision_id": decision_id})
+        await components.event_bus.publish(Event(
+            topic="decision.snapshot",
+            payload={
+                "decision_id": decision_id,
+                "symbol": opportunity.symbol,
+                "side": opportunity.side.value,
+                "entry_price": opportunity.entry_price,
+                "stop_loss_price": opportunity.stop_loss_price,
+                "take_profit_levels": list(opportunity.take_profit_levels),
+                "confidence": opportunity.confidence,
+                "strategy_id": opportunity.strategy_id,
+                "rationale": opportunity.rationale,
+                "agent_consensus": dict(opportunity.agent_consensus),
+                "regime": opportunity.regime,
+                "detected_at": opportunity.detected_at,
+                "is_production": opportunity.is_production,
+                "approved_by": opportunity.approved_by,
+                "kernel_direction": decision.direction,
+                "kernel_confidence": decision.confidence,
+            },
+            source_module="aitos.app",
+        ))
         current_portfolio = portfolio_tracker.build_portfolio_state(components.trade_lifecycle)
         trade = await components.trade_lifecycle.submit_opportunity(opportunity, current_portfolio); submitted += 1
         if trade.state == TradeLifecycleState.POSITION_OPENED: open_symbols.add(candidate.symbol)
