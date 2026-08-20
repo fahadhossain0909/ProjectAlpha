@@ -1,14 +1,4 @@
-"""RLFeedbackLoop — the piece that makes ``TabularBanditRLScorer`` actually
-learn: subscribes to ``trade.position_closed`` on the Event Bus (zero
-direct coupling to the Trade Lifecycle, same pattern as ``JournalSystem``)
-and calls ``scorer.update()`` with the trade's real outcome.
-
-Once this is running, every closed trade — paper or live — makes the next
-``OpportunityScanner.scan_symbol`` call for that (symbol, regime,
-direction) combination a little less neutral. No separate training job,
-no offline step; it trains continuously as trading happens, which is
-exactly what was asked for.
-"""
+"""RL feedback loop for continuously learning trade outcomes."""
 
 from __future__ import annotations
 
@@ -22,7 +12,6 @@ from aitos.intelligence.rl_policy import TabularBanditRLScorer
 from aitos.logging_setup import get_logger
 
 logger = get_logger("aitos.intelligence.rl_feedback")
-
 TrainableRLScorer = Union[TabularBanditRLScorer, DeepValueRLScorer]
 
 
@@ -41,7 +30,7 @@ class RLFeedbackLoop(AITOSModule):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized:
@@ -65,7 +54,6 @@ class RLFeedbackLoop(AITOSModule):
         for sub in self._subscriptions:
             sub.cancel()
         self._subscriptions.clear()
-        logger.info("RLFeedbackLoop shut down")
 
     async def emit_events(self) -> AsyncIterator[Event]:
         return
@@ -83,16 +71,23 @@ class RLFeedbackLoop(AITOSModule):
         risk_amount = trade_dict.get("risk_amount_usd") or 0.0
         pnl = trade_dict.get("pnl")
         if not risk_amount or pnl is None:
-            return None  # can't compute an R-multiple reward without both
+            return None
 
         reward_r_multiple = pnl / risk_amount
         symbol = trade_dict.get("symbol", "unknown")
         regime = trade_dict.get("regime", "unknown")
         direction = trade_dict.get("side", "unknown")
         agent_consensus = trade_dict.get("agent_consensus") or {}
-
         context = {"regime": regime, "direction": direction, **agent_consensus}
-        self._scorer.update(symbol=symbol, context=context, reward_r_multiple=reward_r_multiple)
+
+        if isinstance(self._scorer, DeepValueRLScorer):
+            # Paper/live and the historical-learning worker share one durable
+            # checkpoint. Use the scorer's atomic read-modify-write path so a
+            # concurrent update cannot overwrite another process's learning.
+            self._scorer.update_and_persist(symbol, context, reward_r_multiple)
+        else:
+            self._scorer.update(symbol=symbol, context=context, reward_r_multiple=reward_r_multiple)
+
         self._updates_applied += 1
         self._last_event_time = event.created_at
         logger.info(
