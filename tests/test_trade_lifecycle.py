@@ -7,7 +7,7 @@ from aitos.core.exceptions import TradeNotFoundError
 from aitos.execution.order_executor import SimulatedOrderExecutor
 from aitos.kernel.ai_kernel import AIKernel
 from aitos.models.trade import Opportunity, TradeLifecycleState, TradeSide
-from aitos.risk.models import PortfolioState
+from aitos.risk.models import PortfolioState, PositionExposure
 from aitos.trading.lifecycle import TradeLifecycle
 
 
@@ -130,7 +130,7 @@ async def test_stop_loss_hit_closes_trade_at_loss(event_bus, risk_engine):
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(make_opportunity(breakeven_at_r_multiple=None), make_portfolio())
 
-    closed = await lifecycle.update_price(trade.trade_id, 97.5)  # below SL of 98
+    closed = await lifecycle.update_price(trade.trade_id, 97.5)
 
     assert closed.state == TradeLifecycleState.POSITION_CLOSED
     assert closed.exit_reason == "sl_triggered"
@@ -145,7 +145,7 @@ async def test_take_profit_hit_closes_trade_at_profit(event_bus, risk_engine):
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(make_opportunity(breakeven_at_r_multiple=None), make_portfolio())
 
-    closed = await lifecycle.update_price(trade.trade_id, 105.0)  # above single TP of 104
+    closed = await lifecycle.update_price(trade.trade_id, 105.0)
 
     assert closed.state == TradeLifecycleState.POSITION_CLOSED
     assert closed.exit_reason == "tp_triggered"
@@ -160,37 +160,35 @@ async def test_multi_tp_partial_close_then_final_close(event_bus, risk_engine):
     trade = await lifecycle.submit_opportunity(opportunity, make_portfolio())
     original_size = trade.position_size_usd
 
-    still_open = await lifecycle.update_price(trade.trade_id, 102.5)  # hits first TP
+    still_open = await lifecycle.update_price(trade.trade_id, 102.5)
     assert still_open.state == TradeLifecycleState.POSITION_OPENED
     assert len(still_open.partial_exits) == 1
     assert still_open.position_size_usd < original_size
     assert still_open.take_profit_levels == [106.0]
 
-    closed = await lifecycle.update_price(trade.trade_id, 107.0)  # hits second (final) TP
+    closed = await lifecycle.update_price(trade.trade_id, 107.0)
     assert closed.state == TradeLifecycleState.POSITION_CLOSED
     assert closed.exit_reason == "tp_triggered"
-    assert closed.pnl > 0  # both partial + final legs were profitable
+    assert closed.pnl > 0
 
 
 @pytest.mark.asyncio
 async def test_breakeven_trigger_moves_stop_to_entry(event_bus, risk_engine):
-    opportunity = make_opportunity(breakeven_at_r_multiple=1.0)  # 1R = 2.0 price units (100 -> 98 SL)
+    opportunity = make_opportunity(breakeven_at_r_multiple=1.0)
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(opportunity, make_portfolio())
 
-    updated = await lifecycle.update_price(trade.trade_id, 102.5)  # +1.25R, past the 1R breakeven trigger, below TP of 104
+    updated = await lifecycle.update_price(trade.trade_id, 102.5)
 
     assert updated.state == TradeLifecycleState.POSITION_OPENED
-    assert updated.sl_price == 100.0  # moved to entry
+    assert updated.sl_price == 100.0
     assert updated.breakeven_triggered is True
 
 
 @pytest.mark.asyncio
 async def test_trailing_sl_tightens_as_price_moves_favorably(event_bus, risk_engine):
-    opportunity = make_opportunity(
-        trailing_sl_enabled=True, breakeven_at_r_multiple=None, take_profit_levels=[150.0]  # far TP so trailing dominates
-    )
+    opportunity = make_opportunity(trailing_sl_enabled=True, breakeven_at_r_multiple=None, take_profit_levels=[150.0])
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(opportunity, make_portfolio())
@@ -198,7 +196,7 @@ async def test_trailing_sl_tightens_as_price_moves_favorably(event_bus, risk_eng
 
     updated = await lifecycle.update_price(trade.trade_id, 110.0)
 
-    assert updated.sl_price > initial_sl  # trailing stop tightened upward
+    assert updated.sl_price > initial_sl
     assert updated.state == TradeLifecycleState.POSITION_OPENED
 
 
@@ -248,22 +246,25 @@ async def test_handle_event_auto_updates_matching_open_trade(event_bus, risk_eng
     await lifecycle.initialize({})
     trade = await lifecycle.submit_opportunity(make_opportunity(breakeven_at_r_multiple=None), make_portfolio())
 
-    kline_event = Event(topic=f"market.kline.BTCUSDT.1m", payload={"symbol": "BTCUSDT", "close": 97.0}, source_module="test")
+    kline_event = Event(topic="market.kline.BTCUSDT.1m", payload={"symbol": "BTCUSDT", "close": 97.0}, source_module="test")
     await lifecycle.handle_event(kline_event)
 
     assert trade.trade_id not in [t.trade_id for t in lifecycle.get_open_trades()]
     assert trade.trade_id in [t.trade_id for t in lifecycle.get_closed_trades()]
 
+
 @pytest.mark.asyncio
-async def test_projected_hard_limit_rejects_oversized_candidate_before_order(event_bus, risk_engine):
+async def test_existing_sector_hard_cap_rejects_candidate_before_order(event_bus, risk_engine):
     lifecycle = TradeLifecycle(event_bus=event_bus, risk_engine=risk_engine)
     await lifecycle.initialize({})
 
-    opportunity = make_opportunity(symbol="BNBUSDT", entry_price=100.0, stop_loss_price=99.99)
-    portfolio = make_portfolio(equity_usd=1_000.0, peak_equity_usd=1_000.0, volatility_percentile=0.0, max_pairwise_correlation=0.0)
+    opportunity = make_opportunity(symbol="BNBUSDT", entry_price=100.0, stop_loss_price=99.0)
+    portfolio = make_portfolio(
+        positions=(PositionExposure(symbol="BNBUSDT", notional_usd=410.0, leverage=1.0),),
+    )
 
     trade = await lifecycle.submit_opportunity(opportunity, portfolio)
 
     assert trade.state == TradeLifecycleState.REJECTED
-    assert "projected hard limit breach" in trade.rejection_reason
+    assert "hard limit breach" in trade.rejection_reason
     assert lifecycle.get_open_trades() == []
