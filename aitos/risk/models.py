@@ -24,8 +24,6 @@ class CircuitBreakerState(str, Enum):
 
 
 class RiskLimits(BaseModel):
-    """Configurable risk limits — defaults and hard caps from section 31.2."""
-
     max_risk_per_trade_pct: float = Field(default=1.0, gt=0)
     max_risk_per_trade_hard_cap_pct: float = Field(default=2.0, gt=0)
     max_risk_per_day_pct: float = Field(default=3.0, gt=0)
@@ -73,9 +71,6 @@ class PositionExposure:
     sector: str = ""
 
     def __post_init__(self) -> None:
-        # Centralized fallback keeps every construction path (lifecycle,
-        # paper, live, tests) classified without trusting callers to remember
-        # the taxonomy. Unknown symbols use the conservative ``other`` bucket.
         if not self.sector or self.sector == "unclassified":
             from aitos.risk.sector import sector_for_symbol
             object.__setattr__(self, "sector", sector_for_symbol(self.symbol))
@@ -144,6 +139,13 @@ class LimitBreach:
     observed_value: float
     is_hard_cap: bool
     message: str
+
+    def __post_init__(self) -> None:
+        # Sector exposure is an enforced pre-trade cap.  Keep the separate
+        # absolute 40% hard-cap calculation in RiskEngine so crossing 20%
+        # blocks new entries without immediately tripping the circuit breaker.
+        if self.limit_name.startswith("max_sector_exposure_pct[") and not self.is_hard_cap:
+            object.__setattr__(self, "is_hard_cap", True)
 
 
 @dataclass(frozen=True)
