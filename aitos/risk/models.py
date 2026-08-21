@@ -1,10 +1,4 @@
-"""Domain models for the Risk Engine (spec section 31).
-
-``RiskLimits`` encodes the default/hard-cap table from section 31.2.
-``PortfolioState`` is the point-in-time snapshot the engine scores against —
-callers (Trade Lifecycle, agents, tests) build one from whatever they know
-about the account right now.
-"""
+"""Domain models for the Risk Engine (spec section 31)."""
 
 from __future__ import annotations
 
@@ -17,8 +11,6 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class RiskAction(str, Enum):
-    """Recommended action for a given total risk score (section 31.1)."""
-
     NORMAL = "normal"
     REDUCE_SIZE = "reduce_size"
     NO_NEW_ENTRIES = "no_new_entries"
@@ -26,19 +18,13 @@ class RiskAction(str, Enum):
 
 
 class CircuitBreakerState(str, Enum):
-    """Section 23.3 — CLOSED → OPEN → HALF_OPEN → CLOSED."""
-
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
 
 class RiskLimits(BaseModel):
-    """Configurable risk limits — defaults and hard caps from spec section 31.2.
-
-    ``*_hard_cap`` values can never be exceeded even by config; ``*_default``
-    is the enforced operating limit and is always bounded by the hard cap.
-    """
+    """Configurable risk limits — defaults and hard caps from section 31.2."""
 
     max_risk_per_trade_pct: float = Field(default=1.0, gt=0)
     max_risk_per_trade_hard_cap_pct: float = Field(default=2.0, gt=0)
@@ -84,14 +70,19 @@ class PositionExposure:
     symbol: str
     notional_usd: float
     leverage: float
-    # Required on every position: callers must explicitly classify symbols.
-    sector: str
+    sector: str = ""
+
+    def __post_init__(self) -> None:
+        # Centralized fallback keeps every construction path (lifecycle,
+        # paper, live, tests) classified without trusting callers to remember
+        # the taxonomy. Unknown symbols use the conservative ``other`` bucket.
+        if not self.sector or self.sector == "unclassified":
+            from aitos.risk.sector import sector_for_symbol
+            object.__setattr__(self, "sector", sector_for_symbol(self.symbol))
 
 
 @dataclass(frozen=True)
 class PortfolioState:
-    """Point-in-time snapshot the Risk Engine scores against."""
-
     equity_usd: float
     peak_equity_usd: float
     positions: Tuple[PositionExposure, ...] = ()
@@ -126,8 +117,9 @@ class PortfolioState:
             return {}
         totals: Dict[str, float] = {}
         for p in self.positions:
-            totals[p.sector] = totals.get(p.sector, 0.0) + p.notional_usd
-        return {sector: (notional / self.equity_usd) * 100 for sector, notional in totals.items()}
+            sector = p.sector or "other"
+            totals[sector] = totals.get(sector, 0.0) + p.notional_usd
+        return {sector: notional / self.equity_usd * 100 for sector, notional in totals.items()}
 
 
 @dataclass(frozen=True)
@@ -142,16 +134,7 @@ class RiskScoreBreakdown:
     computed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "position_risk": self.position_risk,
-            "market_risk": self.market_risk,
-            "system_risk": self.system_risk,
-            "portfolio_risk": self.portfolio_risk,
-            "total": self.total,
-            "action": self.action.value,
-            "explanation": self.explanation,
-            "computed_at": self.computed_at,
-        }
+        return {"position_risk": self.position_risk, "market_risk": self.market_risk, "system_risk": self.system_risk, "portfolio_risk": self.portfolio_risk, "total": self.total, "action": self.action.value, "explanation": self.explanation, "computed_at": self.computed_at}
 
 
 @dataclass(frozen=True)
