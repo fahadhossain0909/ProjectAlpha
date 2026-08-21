@@ -98,8 +98,20 @@ jobs:
             docker compose logs --no-color --tail=300 aitos-paper 2>&1 || true
             echo
 
+            echo "=== Recent learning-service logs ==="
+            docker compose logs --no-color --tail=300 aitos-learning 2>&1 || true
+            echo
+
+            echo "=== Learning container state ==="
+            docker inspect --format '{{json .State}}' aitos-learning 2>&1 || true
+            echo
+
+            echo "=== Learning container resource usage ==="
+            docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}' aitos-learning 2>&1 || true
+            echo
+
             echo "=== Recent service errors ==="
-            docker compose logs --no-color --tail=500 2>&1 | grep -Ei 'error|exception|traceback|fatal|critical|panic|unhealthy|failed' | tail -200 || true
+            docker compose logs --no-color --tail=500 2>&1 | grep -Ei 'error|exception|traceback|fatal|critical|panic|unhealthy|failed|oom|killed' | tail -250 || true
             echo
 
             echo "=== ClickHouse health ==="
@@ -132,14 +144,29 @@ jobs:
             echo "Report saved at: $REPORT"
 
       - name: Collect audit report from VPS
-        uses: appleboy/scp-action@v1.0.0
+        id: collect-report
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "aitos-production-audit/report.txt"
-          target: "./"
-          overwrite: true
+          key_path: /tmp/aitos_audit_key
+          command_timeout: 2m
+          capture_stdout: true
+          script: |
+            set -u
+            REPORT="$HOME/aitos-production-audit/report.txt"
+            test -s "$REPORT"
+            cat "$REPORT"
+
+      - name: Write collected audit report
+        shell: bash
+        env:
+          AUDIT_REPORT: ${{ steps.collect-report.outputs.stdout }}
+        run: |
+          set -euo pipefail
+          mkdir -p aitos-production-audit
+          printf '%s\n' "$AUDIT_REPORT" > aitos-production-audit/report.txt
+          test -s aitos-production-audit/report.txt
 
       - name: Upload audit report artifact
         uses: actions/upload-artifact@v4.6.2
