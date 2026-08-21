@@ -23,6 +23,7 @@ DEFAULT_RATE_LIMIT_REFILL_PER_SECOND = 2000 / 60
 MAX_BACKOFF_SECONDS = 60.0
 INITIAL_BACKOFF_SECONDS = 1.0
 ORDERBOOK_BOOTSTRAP_QUEUE_SIZE = 5000
+ORDERBOOK_BOOTSTRAP_READY_TIMEOUT_SECONDS = 10.0
 
 
 class BinanceFuturesAdapter(ExchangeAdapter):
@@ -85,11 +86,12 @@ class BinanceFuturesAdapter(ExchangeAdapter):
     async def stream_order_book(self, symbols: List[str], levels: int = 20) -> AsyncIterator[OrderBookSnapshot]:
         """Reconstruct a local L2 book with loss-aware Binance bootstrap.
 
-        The WebSocket producer starts before REST snapshots are requested, so
-        depth updates cannot be silently lost during the snapshot round trip.
-        Buffered updates are replayed after each snapshot is seeded. Binance
-        U/u/pu continuity is enforced by LocalOrderBook; a gap causes a fresh
-        snapshot bootstrap rather than applying an unsafe update.
+        The WebSocket producer is allowed to connect and buffer at least one
+        depth event before REST snapshots are requested. This ordering is
+        required for a reliable snapshot/diff bootstrap: otherwise a fast REST
+        response can return a snapshot newer than the first WebSocket event,
+        making the first buffered diff unable to bridge the snapshot and causing
+        unnecessary resync loops.
         """
         if not symbols:
             return
@@ -98,16 +100,16 @@ class BinanceFuturesAdapter(ExchangeAdapter):
         symbol_by_stream = {f"{s.lower()}@depth@100ms": s for s in symbols}
         queue: asyncio.Queue[tuple[Any, str]] = asyncio.Queue(maxsize=ORDERBOOK_BOOTSTRAP_QUEUE_SIZE)
         producer_done = asyncio.Event()
+        producer_ready = asyncio.Event()
 
         async def producer() -> None:
             try:
                 async for data, stream_name in self._raw_stream(streams):
+                    producer_ready.set()
                     try:
                         queue.put_nowait((data, stream_name))
                     except asyncio.QueueFull:
                         logger.error("order-book bootstrap buffer overflow; forcing resync", extra={"aitos_extra": {"streams": streams}})
-                        # Dropping old depth events is unsafe. Clear the queue so
-                        # consumers will force a REST resync at the next gap.
                         while not queue.empty():
                             try:
                                 queue.get_nowait()
@@ -122,6 +124,11 @@ class BinanceFuturesAdapter(ExchangeAdapter):
         producer_task = asyncio.create_task(producer(), name="binance-orderbook-producer")
         books: Dict[str, LocalOrderBook] = {}
         try:
+            try:
+                await asyncio.wait_for(producer_ready.wait(), timeout=ORDERBOOK_BOOTSTRAP_READY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise RuntimeError("Binance order-book stream did not receive an initial depth event before bootstrap timeout")
+
             snapshot_tasks = {
                 symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-snapshot-{symbol}")
                 for symbol in symbols
