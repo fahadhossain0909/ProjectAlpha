@@ -19,52 +19,43 @@ from pydantic import BaseModel, Field, model_validator
 class RiskAction(str, Enum):
     """Recommended action for a given total risk score (section 31.1)."""
 
-    NORMAL = "normal"                    # score <= 70
-    REDUCE_SIZE = "reduce_size"           # 70 < score <= 85
-    NO_NEW_ENTRIES = "no_new_entries"     # 85 < score <= 95
-    EMERGENCY_STOP = "emergency_stop"     # score > 95
+    NORMAL = "normal"
+    REDUCE_SIZE = "reduce_size"
+    NO_NEW_ENTRIES = "no_new_entries"
+    EMERGENCY_STOP = "emergency_stop"
 
 
 class CircuitBreakerState(str, Enum):
     """Section 23.3 — CLOSED → OPEN → HALF_OPEN → CLOSED."""
 
-    CLOSED = "closed"      # normal operation
-    OPEN = "open"          # trading paused, positions still managed
-    HALF_OPEN = "half_open"  # cooldown elapsed, testing with reduced size
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class RiskLimits(BaseModel):
     """Configurable risk limits — defaults and hard caps from spec section 31.2.
 
     ``*_hard_cap`` values can never be exceeded even by config; ``*_default``
-    is what's actually enforced unless explicitly raised (still bounded by
-    the hard cap).
+    is the enforced operating limit and is always bounded by the hard cap.
     """
 
     max_risk_per_trade_pct: float = Field(default=1.0, gt=0)
     max_risk_per_trade_hard_cap_pct: float = Field(default=2.0, gt=0)
-
     max_risk_per_day_pct: float = Field(default=3.0, gt=0)
     max_risk_per_day_hard_cap_pct: float = Field(default=5.0, gt=0)
-
     max_risk_per_week_pct: float = Field(default=5.0, gt=0)
     max_risk_per_week_hard_cap_pct: float = Field(default=10.0, gt=0)
-
     max_drawdown_pct: float = Field(default=10.0, gt=0)
     max_drawdown_hard_cap_pct: float = Field(default=20.0, gt=0)
-
     max_leverage: float = Field(default=10.0, ge=1)
     max_leverage_hard_cap: float = Field(default=125.0, ge=1)
-
     max_correlated_exposure_pct: float = Field(default=15.0, gt=0)
     max_correlated_exposure_hard_cap_pct: float = Field(default=25.0, gt=0)
-
     max_sector_exposure_pct: float = Field(default=20.0, gt=0)
     max_sector_exposure_hard_cap_pct: float = Field(default=40.0, gt=0)
-
     max_open_positions: int = Field(default=10, ge=1)
     max_open_positions_hard_cap: int = Field(default=20, ge=1)
-
     min_data_freshness_seconds: float = Field(default=5.0, gt=0)
     min_data_freshness_hard_cap_seconds: float = Field(default=30.0, gt=0)
 
@@ -83,7 +74,6 @@ class RiskLimits(BaseModel):
         for default_field, cap_field in pairs:
             if getattr(self, default_field) > getattr(self, cap_field):
                 raise ValueError(f"{default_field} cannot exceed {cap_field}")
-        # min_data_freshness is inverted (smaller default is stricter, larger is the cap)
         if self.min_data_freshness_seconds > self.min_data_freshness_hard_cap_seconds:
             raise ValueError("min_data_freshness_seconds cannot exceed its hard cap")
         return self
@@ -94,7 +84,8 @@ class PositionExposure:
     symbol: str
     notional_usd: float
     leverage: float
-    sector: str = "unclassified"
+    # Required on every position: callers must explicitly classify symbols.
+    sector: str
 
 
 @dataclass(frozen=True)
@@ -104,15 +95,15 @@ class PortfolioState:
     equity_usd: float
     peak_equity_usd: float
     positions: Tuple[PositionExposure, ...] = ()
-    daily_pnl_pct: float = 0.0     # negative = loss
+    daily_pnl_pct: float = 0.0
     weekly_pnl_pct: float = 0.0
-    volatility_percentile: float = 50.0   # 0-100, current vol vs historical distribution
-    regime: str = "normal"                 # "normal" | "trending" | "volatile" | "crisis"
-    max_pairwise_correlation: float = 0.0  # 0-1, highest correlation among open positions
+    volatility_percentile: float = 50.0
+    regime: str = "normal"
+    max_pairwise_correlation: float = 0.0
     api_error_rate_pct: float = 0.0
     api_latency_ms: float = 0.0
     data_freshness_seconds: float = 0.0
-    model_accuracy: float = 0.75           # 0-1
+    model_accuracy: float = 0.75
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @property
