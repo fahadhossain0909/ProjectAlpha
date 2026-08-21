@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY aitos/ ./aitos/
-COPY run_paper_trading.py run_live_trading.py ./
+COPY run_paper_trading.py run_live_trading.py run_continual_learning.py ./
 
 # Non-root user -- the app has no business running as root, and root
 # inside a container is one less thing to worry about if anything in the
