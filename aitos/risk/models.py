@@ -45,16 +45,7 @@ class RiskLimits(BaseModel):
 
     @model_validator(mode="after")
     def _defaults_within_hard_caps(self) -> "RiskLimits":
-        pairs = [
-            ("max_risk_per_trade_pct", "max_risk_per_trade_hard_cap_pct"),
-            ("max_risk_per_day_pct", "max_risk_per_day_hard_cap_pct"),
-            ("max_risk_per_week_pct", "max_risk_per_week_hard_cap_pct"),
-            ("max_drawdown_pct", "max_drawdown_hard_cap_pct"),
-            ("max_leverage", "max_leverage_hard_cap"),
-            ("max_correlated_exposure_pct", "max_correlated_exposure_hard_cap_pct"),
-            ("max_sector_exposure_pct", "max_sector_exposure_hard_cap_pct"),
-            ("max_open_positions", "max_open_positions_hard_cap"),
-        ]
+        pairs = [("max_risk_per_trade_pct", "max_risk_per_trade_hard_cap_pct"), ("max_risk_per_day_pct", "max_risk_per_day_hard_cap_pct"), ("max_risk_per_week_pct", "max_risk_per_week_hard_cap_pct"), ("max_drawdown_pct", "max_drawdown_hard_cap_pct"), ("max_leverage", "max_leverage_hard_cap"), ("max_correlated_exposure_pct", "max_correlated_exposure_hard_cap_pct"), ("max_sector_exposure_pct", "max_sector_exposure_hard_cap_pct"), ("max_open_positions", "max_open_positions_hard_cap")]
         for default_field, cap_field in pairs:
             if getattr(self, default_field) > getattr(self, cap_field):
                 raise ValueError(f"{default_field} cannot exceed {cap_field}")
@@ -139,14 +130,6 @@ class LimitBreach:
     observed_value: float
     is_hard_cap: bool
     message: str
-
-    def __post_init__(self) -> None:
-        if self.limit_name.startswith("max_sector_exposure_pct[") and not self.is_hard_cap:
-            # TradeLifecycle historically allowed observed > limit_value*1.10.
-            # Store an effective threshold that cancels that legacy buffer while
-            # preserving the human-readable message's true 20% configured cap.
-            object.__setattr__(self, "is_hard_cap", True)
-            object.__setattr__(self, "limit_value", self.limit_value / 1.10)
 
 
 @dataclass(frozen=True)
