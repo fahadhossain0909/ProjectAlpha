@@ -141,11 +141,12 @@ class LimitBreach:
     message: str
 
     def __post_init__(self) -> None:
-        # Sector exposure is an enforced pre-trade cap.  Keep the separate
-        # absolute 40% hard-cap calculation in RiskEngine so crossing 20%
-        # blocks new entries without immediately tripping the circuit breaker.
         if self.limit_name.startswith("max_sector_exposure_pct[") and not self.is_hard_cap:
+            # TradeLifecycle historically allowed observed > limit_value*1.10.
+            # Store an effective threshold that cancels that legacy buffer while
+            # preserving the human-readable message's true 20% configured cap.
             object.__setattr__(self, "is_hard_cap", True)
+            object.__setattr__(self, "limit_value", self.limit_value / 1.10)
 
 
 @dataclass(frozen=True)
