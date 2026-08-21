@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,9 +44,39 @@ DLQ_STREAM = "stream:dlq"
 MAX_DELIVERY_ATTEMPTS = 5
 POLL_INTERVAL_SECONDS = 0.15
 
+# High-volume market streams are transient transport buffers. Historical market
+# data belongs in ClickHouse; trade/decision/journal streams remain unbounded.
+# Defaults are deliberately conservative for the 8–12 GiB VPS profile and can
+# be overridden without a code change through environment variables.
+STREAM_MAXLEN_DEFAULTS = {
+    "market.orderbook.": 25_000,
+    "market.liquidity.": 100_000,
+    "market.live_state.": 25_000,
+}
+
 
 def _stream_key(topic: str) -> str:
     return f"stream:{topic}"
+
+
+def _stream_maxlen(topic: str) -> Optional[int]:
+    """Return the configured bounded length for high-volume market topics."""
+    for prefix, default in STREAM_MAXLEN_DEFAULTS.items():
+        if topic.startswith(prefix):
+            env_name = "REDIS_STREAM_MAXLEN_" + prefix[:-1].replace(".", "_").upper()
+            raw_value = os.getenv(env_name)
+            if raw_value is None:
+                return default
+            try:
+                value = int(raw_value)
+            except ValueError:
+                logger.warning("Invalid %s=%r; using default %d", env_name, raw_value, default)
+                return default
+            if value < 1:
+                logger.warning("Invalid %s=%r; using default %d", env_name, raw_value, default)
+                return default
+            return value
+    return None
 
 
 def validate_event_schema(event: Event) -> None:
@@ -82,8 +113,6 @@ class EventBus(AITOSModule):
         self._subscriptions: List[Subscription] = []
         self._pending_replies: Dict[str, asyncio.Future] = {}
 
-    # -- AITOSModule contract -------------------------------------------------
-
     @property
     def module_id(self) -> str:
         return self._module_id
@@ -94,7 +123,7 @@ class EventBus(AITOSModule):
 
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized:
-            return  # idempotent
+            return
         await self._redis.ping()
         self._initialized = True
         self._started_at = time.monotonic()
@@ -130,17 +159,11 @@ class EventBus(AITOSModule):
         logger.info("EventBus shut down")
 
     async def emit_events(self) -> AsyncIterator[Event]:
-        # The bus itself doesn't originate business events; it only routes
-        # them. Present for AITOSModule interface compliance.
         return
-        yield  # pragma: no cover - makes this an async generator
+        yield  # pragma: no cover
 
     async def handle_event(self, event: Event) -> Optional[EventResponse]:
-        # Bus-level control events (e.g. "eventbus.flush") could be handled
-        # here. Default: no-op.
         return None
-
-    # -- Public Event Bus API --------------------------------------------------
 
     async def publish(self, event: Event, priority: Optional[EventPriority] = None) -> None:
         self._require_initialized()
@@ -158,25 +181,25 @@ class EventBus(AITOSModule):
         )
         self._known_topics.add(event.topic)
         self._last_event_time = datetime.now(timezone.utc).isoformat()
-        await self._redis.xadd(_stream_key(event.topic), event.to_wire())
+        maxlen = _stream_maxlen(event.topic)
+        if maxlen is None:
+            await self._redis.xadd(_stream_key(event.topic), event.to_wire())
+        else:
+            await self._redis.xadd(
+                _stream_key(event.topic),
+                event.to_wire(),
+                maxlen=maxlen,
+                approximate=True,
+            )
         logger.info("published event", extra={"aitos_extra": {"topic": event.topic, "event_id": event.event_id}})
 
-        # If this is a reply to an outstanding request_reply, resolve it.
-        # Only ".reply"-suffixed topics count as replies, so publishing the
-        # original request (which shares the same correlation_id) doesn't
-        # prematurely resolve the waiting future.
         if event.topic.endswith(".reply") and event.correlation_id and event.correlation_id in self._pending_replies:
             fut = self._pending_replies.pop(event.correlation_id)
             if not fut.done():
                 fut.set_result(event)
 
     async def subscribe(self, topic: str, handler: EventHandler, group: str = "default") -> Subscription:
-        """Subscribe to a topic (supports ``*`` glob patterns, e.g. ``intel.*``).
-
-        Runs a background consumer-group loop that reads new messages,
-        invokes ``handler``, ACKs on success, and moves to the DLQ after
-        ``MAX_DELIVERY_ATTEMPTS`` failures.
-        """
+        """Subscribe to a topic (supports ``*`` glob patterns, e.g. ``intel.*``)."""
         self._require_initialized()
         consumer_name = f"{group}-{id(handler)}"
 
@@ -225,7 +248,6 @@ class EventBus(AITOSModule):
         )
 
     async def replay(self, topic: str, since: datetime, handler: EventHandler) -> None:
-        """Replay historical events on ``topic`` from ``since`` onward."""
         self._require_initialized()
         since_ms = int(since.timestamp() * 1000)
         entries = await self._redis.xrange(_stream_key(topic), min=f"{since_ms}-0")
@@ -233,13 +255,10 @@ class EventBus(AITOSModule):
             event = Event.from_wire(fields)
             await handler(event)
 
-    # -- Internals --------------------------------------------------------------
-
     async def _ensure_group(self, stream_key: str, group: str) -> None:
         try:
             await self._redis.xgroup_create(stream_key, group, id="0", mkstream=True)
         except Exception as exc:  # noqa: BLE001
-            # BUSYGROUP means it already exists — fine, idempotent setup.
             if "BUSYGROUP" not in str(exc):
                 raise
 
@@ -269,7 +288,7 @@ class EventBus(AITOSModule):
                         consumername=consumer,
                         streams=stream_map,
                         count=10,
-                        block=None,  # non-blocking; we poll client-side instead (see POLL_INTERVAL_SECONDS)
+                        block=None,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error("xreadgroup error: %s", exc)
