@@ -50,7 +50,6 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key_path: /tmp/aitos_audit_key
           command_timeout: 10m
-          script_stop: true
           script: |
             set -u
             AUDIT_DIR="$HOME/aitos-production-audit"
