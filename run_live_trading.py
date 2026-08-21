@@ -53,7 +53,9 @@ async def main() -> None:
     components = await build_system(event_bus=event_bus, exchange=BinanceFuturesAdapter(), order_executor=order_executor, symbols=SYMBOLS, kline_timeframe=KLINE_TIMEFRAME, scanner_timeframe=KLINE_TIMEFRAME, market_data_repository=market_repo, journal_repository=journal_repo, graph_driver=graph_driver, kernel=AIKernel(event_bus=event_bus, require_human_approval_for_prod=True), rl_scorer=rl_scorer, outcome_classifier=outcome_classifier, attention_explainer=attention_explainer, use_exchange_side_stops=True)
     await initialize_all(components)
     experience_recorder = LearningExperienceRecorder(event_bus, market_repo, source="live"); await experience_recorder.initialize({})
-    health_server = HealthServer(components.all_modules() + [experience_recorder], port=HEALTH_SERVER_PORT); await health_server.start()
+    # The container publishes 127.0.0.1:8091 to the host. Bind inside the
+    # container to all interfaces so Docker's port-forward can reach it.
+    health_server = HealthServer(components.all_modules() + [experience_recorder], host="0.0.0.0", port=HEALTH_SERVER_PORT); await health_server.start()
     tracker = LivePortfolioTracker(order_executor=order_executor); stop_event = asyncio.Event(); loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
     try:
