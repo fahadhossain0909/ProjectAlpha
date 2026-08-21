@@ -47,7 +47,6 @@ TOPIC_TP_TRIGGERED = "trade.tp_triggered"
 TOPIC_TRAILING_SL_UPDATE = "trade.trailing_sl"
 TOPIC_PARTIAL_CLOSE = "trade.partial_close"
 TOPIC_EXCHANGE_STOPS_PLACED = "trade.exchange_stops_placed"
-
 DEFAULT_PARTIAL_CLOSE_FRACTION = 0.5
 
 
@@ -85,7 +84,7 @@ class TradeLifecycle(AITOSModule):
 
     async def emit_events(self) -> AsyncIterator[Event]:
         return
-        yield  # pragma: no cover
+        yield
 
     async def handle_event(self, event: Event) -> Optional[EventResponse]:
         if not self._initialized:
@@ -144,14 +143,13 @@ class TradeLifecycle(AITOSModule):
                         await self._order_executor.cancel_resting_order(trade.symbol, consumed_order_id)
                     return trade
                 return await self._trigger_exit(trade, current_price, "tp_triggered", TOPIC_TP_TRIGGERED)
-        if trade.breakeven_at_r_multiple is not None and not trade.breakeven_triggered:
-            if trade.unrealized_r_multiple(current_price) >= trade.breakeven_at_r_multiple:
-                trade.sl_price = trade.entry_price
-                trade.breakeven_triggered = True
-                trade.updated_at = utc_now_iso()
-                if self._use_exchange_side_stops:
-                    await self._replace_exchange_side_stop_loss(trade)
-                await self._event_bus.publish(Event(topic=TOPIC_POSITION_UPDATED, payload={**trade.to_dict(), "reason": "breakeven"}, source_module=self.module_id))
+        if trade.breakeven_at_r_multiple is not None and not trade.breakeven_triggered and trade.unrealized_r_multiple(current_price) >= trade.breakeven_at_r_multiple:
+            trade.sl_price = trade.entry_price
+            trade.breakeven_triggered = True
+            trade.updated_at = utc_now_iso()
+            if self._use_exchange_side_stops:
+                await self._replace_exchange_side_stop_loss(trade)
+            await self._event_bus.publish(Event(topic=TOPIC_POSITION_UPDATED, payload={**trade.to_dict(), "reason": "breakeven"}, source_module=self.module_id))
         if trade.trailing_sl_enabled:
             candidate_sl = current_price - trade.r_distance if is_long else current_price + trade.r_distance
             improved = (is_long and candidate_sl > trade.sl_price) or (not is_long and candidate_sl < trade.sl_price)
@@ -246,14 +244,32 @@ class TradeLifecycle(AITOSModule):
 
     async def _validate_and_open(self, opportunity: Opportunity, portfolio: PortfolioState) -> Trade:
         from aitos.risk.position_sizing import calculate_position_size
+        from aitos.risk.sector import sector_for_symbol
+
         risk_score = self._risk_engine.last_assessment.total if self._risk_engine.last_assessment else 0.0
-        sizing = calculate_position_size(equity_usd=portfolio.equity_usd, entry_price=opportunity.entry_price, stop_loss_price=opportunity.stop_loss_price, risk_limits=self._risk_engine.limits, risk_score=risk_score, volatility_percentile=portfolio.volatility_percentile, correlation_penalty=portfolio.max_pairwise_correlation)
+        candidate_sector = sector_for_symbol(opportunity.symbol)
+        existing_sector_notional = sum(p.notional_usd for p in portfolio.positions if p.sector == candidate_sector)
+        sizing = calculate_position_size(
+            equity_usd=portfolio.equity_usd,
+            entry_price=opportunity.entry_price,
+            stop_loss_price=opportunity.stop_loss_price,
+            risk_limits=self._risk_engine.limits,
+            risk_score=risk_score,
+            volatility_percentile=portfolio.volatility_percentile,
+            correlation_penalty=portfolio.max_pairwise_correlation,
+            existing_sector_notional_usd=existing_sector_notional,
+            sector_limit_pct=self._risk_engine.limits.max_sector_exposure_pct,
+        )
+        if sizing.position_size_usd <= 0.0:
+            return await self._reject(opportunity, f"sector exposure cap exhausted for {candidate_sector}")
+
         projected_portfolio = self._project_portfolio(portfolio, opportunity, sizing)
-        # Enforce the configured sector cap at the pre-trade gate. There is no
-        # legacy 10% overshoot allowance: a projected sector breach is blocked.
-        projected_breaches = [b for b in self._risk_engine.check_limits(projected_portfolio) if b.limit_name.startswith("max_sector_exposure_pct[")]
-        if projected_breaches:
-            return await self._reject(opportunity, f"projected sector limit breach: {projected_breaches[0].message}")
+        # Default sector cap is enforced by sizing. Only an absolute hard cap
+        # breach (40% by default) is allowed to reject after projection.
+        projected_hard_breaches = [b for b in self._risk_engine.check_limits(projected_portfolio) if b.is_hard_cap]
+        if projected_hard_breaches:
+            return await self._reject(opportunity, f"projected hard limit breach: {projected_hard_breaches[0].message}")
+
         await self._event_bus.publish(Event(topic=TOPIC_ENTRY_SIGNAL, payload={"symbol": opportunity.symbol, "side": opportunity.side.value, "sizing_rationale": sizing.rationale}, source_module=self.module_id))
         quantity = sizing.position_size_usd / opportunity.entry_price
         order_result = await self._order_executor.submit_order(OrderRequest(symbol=opportunity.symbol, side=opportunity.side, quantity=quantity, reference_price=opportunity.entry_price))
