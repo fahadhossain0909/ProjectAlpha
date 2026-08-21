@@ -1,15 +1,4 @@
-"""Dynamic Position Sizing + Adaptive Leverage — spec section 30.2.
-
-    Dynamic Position Sizing: Kelly criterion variant adjusted by current
-    volatility and correlation.
-    Adaptive Leverage: Inverse function of volatility and risk score.
-    Max 125x (Binance limit), typically 1-20x.
-
-Like the Decision Fusion Engine's weighted vote, these are deliberately
-transparent, explainable heuristic formulas — the exact seam a more
-sophisticated (ML-fitted Kelly, regime-conditioned vol model, ...) version
-plugs into later without changing the function signatures.
-"""
+"""Dynamic Position Sizing + Adaptive Leverage — spec section 30.2."""
 
 from __future__ import annotations
 
@@ -17,11 +6,7 @@ from aitos.risk.models import PositionSizeResult, RiskLimits
 
 
 def kelly_fraction(win_rate: float, win_loss_ratio: float) -> float:
-    """Classic Kelly fraction: f* = W - (1-W)/R, clamped to [0, 1].
-
-    ``win_rate`` (W) is the historical/expected probability of a winning
-    trade; ``win_loss_ratio`` (R) is average win size / average loss size.
-    """
+    """Classic Kelly fraction: f* = W - (1-W)/R, clamped to [0, 1]."""
     if not 0.0 <= win_rate <= 1.0:
         raise ValueError("win_rate must be within [0.0, 1.0]")
     if win_loss_ratio <= 0:
@@ -36,21 +21,13 @@ def calculate_adaptive_leverage(
     risk_limits: RiskLimits,
     base_leverage: float = 10.0,
 ) -> float:
-    """Leverage shrinks as volatility and/or risk score rise.
-
-    ``volatility_percentile`` and ``risk_score`` are both 0-100. At the
-    extremes (100/100) leverage bottoms out near 1x; at 0/0 it's
-    ``base_leverage``. Always clamped to ``risk_limits.max_leverage``.
-    """
+    """Leverage shrinks as volatility and/or risk score rise."""
     volatility_percentile = max(0.0, min(volatility_percentile, 100.0))
     risk_score = max(0.0, min(risk_score, 100.0))
-
-    vol_damp = 1.0 - (volatility_percentile / 100.0) * 0.8   # 0.2x .. 1.0x
-    risk_damp = 1.0 - (risk_score / 100.0) * 0.9              # 0.1x .. 1.0x
-
+    vol_damp = 1.0 - (volatility_percentile / 100.0) * 0.8
+    risk_damp = 1.0 - (risk_score / 100.0) * 0.9
     leverage = base_leverage * vol_damp * risk_damp
-    leverage = max(1.0, min(leverage, risk_limits.max_leverage))
-    return round(leverage, 2)
+    return round(max(1.0, min(leverage, risk_limits.max_leverage)), 2)
 
 
 def calculate_position_size(
@@ -65,26 +42,23 @@ def calculate_position_size(
     correlation_penalty: float = 0.0,
     requested_risk_pct: float | None = None,
     base_leverage: float = 10.0,
+    existing_sector_notional_usd: float = 0.0,
+    sector_limit_pct: float | None = None,
 ) -> PositionSizeResult:
-    """Compute a position size in USD notional plus the leverage to use.
+    """Compute a position size in USD *notional* plus leverage.
 
-    Sizing logic:
-    1. Start from ``requested_risk_pct`` (or the configured default),
-       capped at the hard-cap limit — never exceedable regardless of input.
-    2. If ``win_rate``/``win_loss_ratio`` are supplied, scale risk by a
-       Kelly-derived confidence factor (a coin-flip-edge Kelly of 0.5 keeps
-       the requested risk unchanged; lower edges shrink it, floor 10%).
-    3. Dampen further for volatility and open-position correlation — both
-       only ever shrink size, never grow it beyond step 1's cap.
-    4. Convert the resulting risk-in-dollars to a position size via the
-       stop distance, and derive leverage independently via
-       ``calculate_adaptive_leverage``.
+    The sector cap is applied to notional, not margin.  This is intentional:
+    leverage is already controlled separately, while sector exposure measures
+    the actual market notional concentrated in one sector.  The projected
+    notional is therefore capped before an order can reach the executor.
     """
     if equity_usd <= 0:
         raise ValueError("equity_usd must be positive")
     stop_distance = abs(entry_price - stop_loss_price)
     if stop_distance <= 0:
         raise ValueError("stop_loss_price must differ from entry_price")
+    if existing_sector_notional_usd < 0:
+        raise ValueError("existing_sector_notional_usd cannot be negative")
 
     risk_pct = requested_risk_pct if requested_risk_pct is not None else risk_limits.max_risk_per_trade_pct
     risk_pct = min(risk_pct, risk_limits.max_risk_per_trade_hard_cap_pct)
@@ -96,8 +70,8 @@ def calculate_position_size(
         risk_pct *= kelly_scalar
         kelly_note = f", kelly_fraction={kf:.3f} (scalar={kelly_scalar:.2f})"
 
-    vol_factor = 1.0 - (max(0.0, min(volatility_percentile, 100.0)) / 100.0) * 0.5   # 0.5x .. 1.0x
-    corr_factor = 1.0 - max(0.0, min(correlation_penalty, 1.0)) * 0.5                # 0.5x .. 1.0x
+    vol_factor = 1.0 - (max(0.0, min(volatility_percentile, 100.0)) / 100.0) * 0.5
+    corr_factor = 1.0 - max(0.0, min(correlation_penalty, 1.0)) * 0.5
     risk_pct *= vol_factor * corr_factor
 
     risk_amount_usd = equity_usd * (risk_pct / 100.0)
@@ -110,7 +84,23 @@ def calculate_position_size(
     if capped_by_leverage:
         position_size_usd = max_notional_usd
 
-    cap_note = f", leverage_notional_cap={max_notional_usd:.2f}" if capped_by_leverage else ""
+    sector_capped = False
+    sector_cap_usd: float | None = None
+    if sector_limit_pct is not None:
+        if sector_limit_pct <= 0:
+            raise ValueError("sector_limit_pct must be positive")
+        sector_cap_usd = equity_usd * (sector_limit_pct / 100.0)
+        available_sector_notional_usd = max(0.0, sector_cap_usd - existing_sector_notional_usd)
+        sector_capped = position_size_usd > available_sector_notional_usd
+        if sector_capped:
+            position_size_usd = available_sector_notional_usd
+
+    cap_notes = []
+    if capped_by_leverage:
+        cap_notes.append(f"leverage_notional_cap={max_notional_usd:.2f}")
+    if sector_capped:
+        cap_notes.append(f"sector_notional_cap={sector_cap_usd:.2f}")
+    cap_note = ", " + ", ".join(cap_notes) if cap_notes else ""
     rationale = (
         f"risk={risk_pct:.3f}% of equity (vol_factor={vol_factor:.2f}, corr_factor={corr_factor:.2f}"
         f"{kelly_note}), leverage={leverage}x{cap_note} "
