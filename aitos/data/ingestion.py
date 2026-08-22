@@ -28,12 +28,13 @@ class DataIngestionService(AITOSModule):
         self._orderbook_levels = orderbook_levels; self._liquidity_trade_window = max(50, liquidity_trade_window)
         self._initialized = False; self._tasks: List[asyncio.Task] = []; self._last_event_time: Optional[str] = None
         self._ticks_processed = 0; self._liquidity_events = 0; self._orderflow_events = 0; self._errors = 0
+        self._trade_events_received = 0; self._trade_parse_errors = 0; self._last_trade_event_time: Optional[str] = None
         self._live_state = LiveMarketStateStore(max_trades=max(5000, self._liquidity_trade_window))
         self._recent_trades = self._live_state.trades
     @property
     def module_id(self) -> str: return "data-ingestion-service"
     @property
-    def version(self) -> str: return "1.3.0"
+    def version(self) -> str: return "1.4.0"
     @property
     def live_state(self) -> LiveMarketStateStore: return self._live_state
     async def initialize(self, config: Dict[str, Any]) -> None:
@@ -41,7 +42,7 @@ class DataIngestionService(AITOSModule):
         await self._exchange.connect(); self._tasks = [asyncio.create_task(self._run_kline_stream()), asyncio.create_task(self._run_trade_stream()), asyncio.create_task(self._run_orderbook_stream())]; self._initialized = True
     async def health_check(self) -> HealthStatus:
         alive = sum(1 for t in self._tasks if not t.done()); status = ModuleStatus.UNHEALTHY if self._errors else ModuleStatus.HEALTHY if alive == len(self._tasks) else ModuleStatus.DEGRADED
-        return HealthStatus(module_id=self.module_id, status=status, latency_ms=0.0, last_event_time=self._last_event_time, details={"ticks_processed": self._ticks_processed, "liquidity_events": self._liquidity_events, "orderflow_events": self._orderflow_events, "errors": self._errors, "tasks_alive": alive})
+        return HealthStatus(module_id=self.module_id, status=status, latency_ms=0.0, last_event_time=self._last_event_time, details={"ticks_processed": self._ticks_processed, "liquidity_events": self._liquidity_events, "orderflow_events": self._orderflow_events, "errors": self._errors, "tasks_alive": alive, "trade_events_received": self._trade_events_received, "trade_parse_errors": self._trade_parse_errors, "last_trade_event_time": self._last_trade_event_time})
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
         for task in self._tasks: task.cancel()
         if self._tasks: await asyncio.wait(self._tasks, timeout=grace_period_seconds)
@@ -63,7 +64,7 @@ class DataIngestionService(AITOSModule):
         try:
             async for trade in self._exchange.stream_trades(self._symbols): await self._handle_trade(trade)
         except asyncio.CancelledError: return
-        except Exception as exc: self._errors += 1; logger.error("trade stream loop crashed: %s", exc)
+        except Exception as exc: self._errors += 1; self._trade_parse_errors += 1; logger.error("trade stream loop crashed: %s", exc)
     async def _run_orderbook_stream(self) -> None:
         try:
             async for book in self._exchange.stream_order_book(self._symbols, self._orderbook_levels): await self._handle_order_book(book)
@@ -74,10 +75,16 @@ class DataIngestionService(AITOSModule):
         if self._repository is not None: await self._repository.save_kline(kline)
         self._tick_processed()
     async def _handle_trade(self, trade: TradeTick) -> None:
-        await self._event_bus.publish(Event(topic=trade_topic(trade.symbol), payload=trade.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL))
-        if self._repository is not None: await self._repository.save_trade_tick(trade)
-        features = self._live_state.on_trade(trade)
-        await self._event_bus.publish(Event(topic=orderflow_topic(trade.symbol), payload={"trade_count": features.trade_count, "buy_volume": features.buy_volume, "sell_volume": features.sell_volume, "delta": features.delta, "cvd": features.cvd, "buy_ratio": features.buy_ratio, "aggression": features.aggression, "imbalance": features.imbalance, "vwap": features.vwap, "last_price": features.last_price, "direction": features.direction, "timestamp": features.timestamp.isoformat() if features.timestamp else None}, source_module=self.module_id, priority=EventPriority.NORMAL)); self._orderflow_events += 1; self._publish_live_state(trade.symbol); self._tick_processed()
+        self._trade_events_received += 1
+        self._last_trade_event_time = datetime.now(timezone.utc).isoformat()
+        try:
+            await self._event_bus.publish(Event(topic=trade_topic(trade.symbol), payload=trade.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL))
+            if self._repository is not None: await self._repository.save_trade_tick(trade)
+            features = self._live_state.on_trade(trade)
+            await self._event_bus.publish(Event(topic=orderflow_topic(trade.symbol), payload={"trade_count": features.trade_count, "buy_volume": features.buy_volume, "sell_volume": features.sell_volume, "delta": features.delta, "cvd": features.cvd, "buy_ratio": features.buy_ratio, "aggression": features.aggression, "imbalance": features.imbalance, "vwap": features.vwap, "last_price": features.last_price, "direction": features.direction, "timestamp": features.timestamp.isoformat() if features.timestamp else None}, source_module=self.module_id, priority=EventPriority.NORMAL)); self._orderflow_events += 1; self._publish_live_state(trade.symbol); self._tick_processed()
+        except Exception:
+            self._trade_parse_errors += 1
+            raise
     async def _handle_order_book(self, book: OrderBookSnapshot) -> None:
         await self._event_bus.publish(Event(topic=orderbook_topic(book.symbol), payload=book.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL))
         if self._repository is not None: await self._repository.save_order_book_snapshot(book)
