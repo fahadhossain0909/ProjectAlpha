@@ -18,6 +18,7 @@ from aitos.models.market import FundingRate, Kline, OpenInterest, OrderBookSnaps
 logger = get_logger("aitos.exchange.binance")
 REST_BASE_URL = "https://fapi.binance.com"
 WS_BASE_URL = "wss://fstream.binance.com/stream"
+WS_SINGLE_BASE_URL = "wss://fstream.binance.com/ws"
 DEFAULT_RATE_LIMIT_CAPACITY = 2000
 DEFAULT_RATE_LIMIT_REFILL_PER_SECOND = 2000 / 60
 MAX_BACKOFF_SECONDS = 60.0
@@ -77,20 +78,52 @@ class BinanceFuturesAdapter(ExchangeAdapter):
             yield kline
 
     async def stream_trades(self, symbols: List[str]) -> AsyncIterator[TradeTick]:
-        streams = [f"{s.lower()}@aggTrade" for s in symbols]
-        async def _parse(data: Any) -> TradeTick:
-            return parse_agg_trade_ws(data)
-        async for trade in self._stream(streams, _parse):
-            yield trade
+        """Consume Binance Futures aggTrade streams using one direct socket per symbol.
+
+        The order-book/kline paths use combined streams, but trade ingestion gets
+        an explicit /ws/<stream> connection so a silent or malformed combined
+        envelope cannot hide a symbol-level aggTrade subscription failure.
+        """
+        if not symbols:
+            return
+
+        queue: asyncio.Queue[tuple[TradeTick, str]] = asyncio.Queue(maxsize=2000)
+        tasks: List[asyncio.Task] = []
+
+        async def consume(symbol: str) -> None:
+            stream = f"{symbol.lower()}@aggTrade"
+            url = f"{WS_SINGLE_BASE_URL}/{stream}"
+            while True:
+                try:
+                    async with self._ws_connector(url) as ws:
+                        logger.info("connected to Binance trade stream", extra={"aitos_extra": {"symbol": symbol, "stream": stream, "mode": "direct"}})
+                        async for raw_message in ws:
+                            try:
+                                envelope = json.loads(raw_message)
+                                trade = parse_agg_trade_ws(envelope.get("data", envelope))
+                            except Exception as exc:
+                                logger.error("invalid Binance aggTrade message", extra={"aitos_extra": {"symbol": symbol, "error": str(exc)}})
+                                continue
+                            await queue.put((trade, symbol))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("Binance trade stream disconnected, reconnecting", extra={"aitos_extra": {"symbol": symbol, "error": str(exc), "mode": "direct"}})
+                    await asyncio.sleep(INITIAL_BACKOFF_SECONDS)
+
+        try:
+            tasks = [asyncio.create_task(consume(symbol), name=f"binance-trade-{symbol}") for symbol in symbols]
+            while True:
+                trade, _ = await queue.get()
+                yield trade
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stream_order_book(self, symbols: List[str], levels: int = 20) -> AsyncIterator[OrderBookSnapshot]:
-        """Reconstruct a local L2 book with loss-aware Binance bootstrap.
-
-        The WebSocket producer buffers depth events before REST snapshots are
-        requested. If the socket reconnects, a reconnect boundary is emitted
-        before new depth events; all local books are then reseeded from REST so
-        the consumer never attempts to bridge a sequence across a disconnect.
-        """
+        """Reconstruct a local L2 book with loss-aware Binance bootstrap."""
         if not symbols:
             return
 
@@ -127,10 +160,7 @@ class BinanceFuturesAdapter(ExchangeAdapter):
             except asyncio.TimeoutError:
                 raise RuntimeError("Binance order-book stream did not receive an initial depth event before bootstrap timeout")
 
-            snapshot_tasks = {
-                symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-snapshot-{symbol}")
-                for symbol in symbols
-            }
+            snapshot_tasks = {symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-snapshot-{symbol}") for symbol in symbols}
             for symbol, task in snapshot_tasks.items():
                 book = LocalOrderBook(symbol, max_levels=max(100, levels * 5))
                 book.seed(await task)
@@ -143,19 +173,12 @@ class BinanceFuturesAdapter(ExchangeAdapter):
                     data, stream_name = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
-
-                # _raw_stream emits this boundary immediately after a socket
-                # disconnect. Do a clean REST reseed before accepting new diffs.
                 if stream_name == "__reconnect__":
                     logger.warning("Binance order-book stream reconnected; reseeding local books", extra={"aitos_extra": {"symbols": symbols}})
-                    snapshot_tasks = {
-                        symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-resync-{symbol}")
-                        for symbol in symbols
-                    }
+                    snapshot_tasks = {symbol: asyncio.create_task(self.fetch_order_book(symbol, limit=max(100, levels)), name=f"orderbook-resync-{symbol}") for symbol in symbols}
                     for symbol, task in snapshot_tasks.items():
                         books[symbol].seed(await task)
                     continue
-
                 symbol = symbol_by_stream.get(stream_name)
                 if symbol is None:
                     continue
@@ -203,9 +226,6 @@ class BinanceFuturesAdapter(ExchangeAdapter):
             except Exception as exc:
                 logger.error("Binance stream disconnected, reconnecting", extra={"aitos_extra": {"error": str(exc), "backoff_seconds": backoff}})
                 if emit_reconnect:
-                    # Pause the producer at an explicit epoch boundary. The
-                    # order-book consumer reseeds all symbols before this
-                    # generator is allowed to reconnect and emit new diffs.
                     yield None, "__reconnect__"
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
