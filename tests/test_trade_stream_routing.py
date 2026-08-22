@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -25,7 +26,7 @@ class FakeWS:
 
 
 @pytest.mark.asyncio
-async def test_stream_trades_uses_futures_aggtrade_combined_stream():
+async def test_stream_trades_uses_futures_aggtrade_direct_socket_without_hot_reconnect():
     urls = []
 
     def connector(url):
@@ -46,9 +47,13 @@ async def test_stream_trades_uses_futures_aggtrade_combined_stream():
         ])
 
     adapter = BinanceFuturesAdapter(ws_connector=connector)
-    trade = await anext(adapter.stream_trades(["BTCUSDT"]))
+    stream = adapter.stream_trades(["BTCUSDT"])
+    trade = await anext(stream)
+    await asyncio.sleep(0.01)
 
     assert trade.symbol == "BTCUSDT"
     assert trade.price == 50000.0
     assert trade.quantity == 0.01
     assert urls == ["wss://fstream.binance.com/ws/btcusdt@aggTrade"]
+
+    await stream.aclose()
