@@ -114,6 +114,11 @@ async def test_ingestion_publishes_events_and_persists(event_bus):
 
     health = await service.health_check()
     assert health.details["ticks_processed"] == 3
+    assert health.details["trade_stream_messages_received"] == 1
+    assert health.details["trade_events_received"] == 1
+    assert health.details["trade_parse_errors"] == 0
+    assert health.details["trade_stream_errors"] == 0
+    assert health.details["last_trade_event_time"] is not None
 
     await service.shutdown(grace_period_seconds=2.0)
     assert exchange.closed is True
