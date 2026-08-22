@@ -119,8 +119,10 @@ class FakeWebSocket:
 
     def __init__(self, messages: List[dict]):
         self._messages = messages
+        self.url = None
 
     def __call__(self, url: str):
+        self.url = url
         return self
 
     async def __aenter__(self):
@@ -177,4 +179,4 @@ async def test_stream_trades_yields_parsed_events_from_single_stream_endpoint():
     await asyncio.wait_for(consume(), timeout=5)
     assert len(received) == 1
     assert received[0].trade_id == 999999
-    assert fake_ws._messages == []
+    assert fake_ws.url == f"{WS_BASE_URL}?streams=btcusdt@aggTrade"
