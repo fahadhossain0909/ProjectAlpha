@@ -41,6 +41,18 @@ def test_valid_multi_update_chain_replays_in_order():
     assert (98.0, 2.0) in book.snapshot().bids
 
 
+def test_pu_is_authoritative_even_when_first_update_id_jumps():
+    book = LocalOrderBook("BTCUSDT")
+    book.seed(snap(200))
+    book.apply(DepthUpdate(199, 201, 0, (), (), 1000))
+    # Binance's `pu` links the event to the previously applied event. The
+    # first ID may span a range, so continuity must not be rejected solely
+    # because U is greater than local+1 when pu is correct.
+    result = book.apply(DepthUpdate(203, 205, 201, ((100.0, 6.0),), (), 1100))
+    assert result.last_update_id == 205
+    assert result.bids[0] == (100.0, 6.0)
+
+
 def test_gap_requires_resync_before_new_updates_can_be_applied():
     book = LocalOrderBook("BTCUSDT")
     book.seed(snap(300))

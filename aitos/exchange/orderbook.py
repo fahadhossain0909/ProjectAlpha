@@ -49,10 +49,12 @@ class LocalOrderBook:
                 raise OrderBookSequenceError(f"first diff does not bridge snapshot for {self.symbol}: snapshot={self.last_update_id}, U={update.first_update_id}, u={update.final_update_id}")
             self._awaiting_first_update = False
         else:
+            # For Binance Futures diff-depth, `pu` is the authoritative link
+            # to the previously applied event. Do not independently require
+            # U == local + 1: an event may span a range of update IDs, while
+            # pu == local still proves that no event boundary was skipped.
             if update.previous_update_id != self.last_update_id:
                 raise OrderBookSequenceError(f"depth chain break for {self.symbol}: pu={update.previous_update_id}, local={self.last_update_id}")
-            if update.first_update_id > self.last_update_id + 1:
-                raise OrderBookSequenceError(f"depth gap for {self.symbol}: expected={self.last_update_id + 1}, U={update.first_update_id}")
         self._apply_levels(self._bids, update.bids)
         self._apply_levels(self._asks, update.asks)
         self.last_update_id = update.final_update_id
