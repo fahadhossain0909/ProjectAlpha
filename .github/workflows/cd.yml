@@ -168,8 +168,19 @@ jobs:
             ENVEOF
             chmod 600 .env
 
-            # Refuse to deploy if required production credentials are missing.
-            for name in REDIS_PASSWORD CLICKHOUSE_PASSWORD NEO4J_PASSWORD BINANCE_API_KEY BINANCE_API_SECRET SECRET_KEY API_KEY; do
+            # Binance credentials are intentionally optional for testing/paper trading.
+            # They become mandatory only when the live trading profile is explicitly enabled.
+            if [ "${{ secrets.BINANCE_TESTNET || 'true' }}" = "false" ]; then
+              for name in BINANCE_API_KEY BINANCE_API_SECRET; do
+                value=$(grep -m1 "^${name}=" .env | cut -d= -f2- || true)
+                if [ -z "$value" ]; then
+                  echo "::error::Live Binance trading is enabled but $name is empty"
+                  exit 1
+                fi
+              done
+            fi
+
+            for name in REDIS_PASSWORD CLICKHOUSE_PASSWORD NEO4J_PASSWORD SECRET_KEY API_KEY; do
               value=$(grep -m1 "^${name}=" .env | cut -d= -f2- || true)
               if [ -z "$value" ]; then
                 echo "::error::Required runtime secret $name is empty"
