@@ -78,25 +78,28 @@ class BinanceFuturesAdapter(ExchangeAdapter):
             yield kline
 
     async def stream_trades(self, symbols: List[str]) -> AsyncIterator[TradeTick]:
-        """Consume Binance Futures aggTrade streams using one direct socket per symbol.
+        """Consume Binance Futures aggTrade using one stream URL per symbol.
 
-        The order-book/kline paths use combined streams, but trade ingestion gets
-        an explicit /ws/<stream> connection so a silent or malformed combined
-        envelope cannot hide a symbol-level aggTrade subscription failure.
+        Keep each symbol on its own connection, but use Binance's ``/stream``
+        endpoint rather than ``/ws/<stream>``. The production audit showed the
+        direct ``/ws`` connections staying silent while the same host's combined
+        ``/stream`` endpoint was actively delivering order-book events. A
+        single-stream ``/stream`` connection preserves symbol isolation without
+        depending on the silent endpoint observed in production.
         """
         if not symbols:
             return
 
-        queue: asyncio.Queue[tuple[TradeTick, str]] = asyncio.Queue(maxsize=2000)
+        queue: asyncio.Queue[TradeTick] = asyncio.Queue(maxsize=2000)
         tasks: List[asyncio.Task] = []
 
         async def consume(symbol: str) -> None:
             stream = f"{symbol.lower()}@aggTrade"
-            url = f"{WS_SINGLE_BASE_URL}/{stream}"
+            url = f"{WS_BASE_URL}?streams={stream}"
             while True:
                 try:
                     async with self._ws_connector(url) as ws:
-                        logger.info("connected to Binance trade stream", extra={"aitos_extra": {"symbol": symbol, "stream": stream, "mode": "direct"}})
+                        logger.info("connected to Binance trade stream", extra={"aitos_extra": {"symbol": symbol, "stream": stream, "mode": "single-stream"}})
                         async for raw_message in ws:
                             try:
                                 envelope = json.loads(raw_message)
@@ -104,19 +107,18 @@ class BinanceFuturesAdapter(ExchangeAdapter):
                             except Exception as exc:
                                 logger.error("invalid Binance aggTrade message", extra={"aitos_extra": {"symbol": symbol, "error": str(exc)}})
                                 continue
-                            await queue.put((trade, symbol))
-                    logger.warning("Binance trade stream closed, reconnecting", extra={"aitos_extra": {"symbol": symbol, "mode": "direct", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
+                            await queue.put(trade)
+                    logger.warning("Binance trade stream closed, reconnecting", extra={"aitos_extra": {"symbol": symbol, "mode": "single-stream", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.error("Binance trade stream disconnected, reconnecting", extra={"aitos_extra": {"symbol": symbol, "error": str(exc), "mode": "direct", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
+                    logger.error("Binance trade stream disconnected, reconnecting", extra={"aitos_extra": {"symbol": symbol, "error": str(exc), "mode": "single-stream", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
                 await asyncio.sleep(INITIAL_BACKOFF_SECONDS)
 
         try:
             tasks = [asyncio.create_task(consume(symbol), name=f"binance-trade-{symbol}") for symbol in symbols]
             while True:
-                trade, _ = await queue.get()
-                yield trade
+                yield await queue.get()
         finally:
             for task in tasks:
                 task.cancel()

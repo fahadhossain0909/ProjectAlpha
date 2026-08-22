@@ -5,7 +5,7 @@ from typing import List
 import pytest
 from aioresponses import aioresponses
 
-from aitos.exchange.binance import REST_BASE_URL, BinanceFuturesAdapter
+from aitos.exchange.binance import REST_BASE_URL, WS_BASE_URL, BinanceFuturesAdapter
 from tests.test_binance_parsing import (
     SAMPLE_DEPTH_REST,
     SAMPLE_KLINE_ROW,
@@ -119,8 +119,10 @@ class FakeWebSocket:
 
     def __init__(self, messages: List[dict]):
         self._messages = messages
+        self.url = None
 
     def __call__(self, url: str):
+        self.url = url
         return self
 
     async def __aenter__(self):
@@ -135,8 +137,6 @@ class FakeWebSocket:
     async def _iter(self):
         for msg in self._messages:
             yield json.dumps(msg)
-        # Simulate the stream just staying open with no more messages —
-        # the test cancels the consumer task rather than waiting forever.
         await asyncio.sleep(3600)
 
 
@@ -162,7 +162,7 @@ async def test_stream_klines_yields_parsed_events():
 
 
 @pytest.mark.asyncio
-async def test_stream_trades_yields_parsed_events():
+async def test_stream_trades_yields_parsed_events_from_single_stream_endpoint():
     from tests.test_binance_parsing import SAMPLE_AGG_TRADE_WS
 
     envelope = {"stream": "btcusdt@aggTrade", "data": SAMPLE_AGG_TRADE_WS}
@@ -179,3 +179,4 @@ async def test_stream_trades_yields_parsed_events():
     await asyncio.wait_for(consume(), timeout=5)
     assert len(received) == 1
     assert received[0].trade_id == 999999
+    assert fake_ws.url == f"{WS_BASE_URL}?streams=btcusdt@aggTrade"
