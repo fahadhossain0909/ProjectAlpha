@@ -26,12 +26,14 @@ class LearningExperienceRecorder(AITOSModule):
         self._subscriptions: List[Subscription] = []
         self._initialized = False
         self._records_written = 0
+        self._decision_events_received = 0
+        self._outcome_events_received = 0
         self._last_event_time: Optional[str] = None
 
     @property
     def module_id(self) -> str: return f"learning-experience-recorder-{self._source}"
     @property
-    def version(self) -> str: return "1.0.1"
+    def version(self) -> str: return "1.1.0"
 
     async def initialize(self, config: Dict[str, Any]) -> None:
         if self._initialized: return
@@ -46,7 +48,7 @@ class LearningExperienceRecorder(AITOSModule):
         return HealthStatus(module_id=self.module_id,
                             status=ModuleStatus.HEALTHY if self._initialized else ModuleStatus.UNHEALTHY,
                             latency_ms=0.0, last_event_time=self._last_event_time,
-                            details={"records_written": self._records_written, "source": self._source})
+                            details={"records_written": self._records_written, "decision_events_received": self._decision_events_received, "outcome_events_received": self._outcome_events_received, "source": self._source})
 
     async def shutdown(self, grace_period_seconds: float = 30.0) -> None:
         for sub in self._subscriptions: sub.cancel()
@@ -64,6 +66,7 @@ class LearningExperienceRecorder(AITOSModule):
             self._records_written += 1
 
     async def _on_decision(self, event: Event) -> Optional[EventResponse]:
+        self._decision_events_received += 1
         p = dict(event.payload)
         record = ExperienceRecord(
             timestamp=_event_time(event), source=self._source,
@@ -84,6 +87,7 @@ class LearningExperienceRecorder(AITOSModule):
         return None
 
     async def _on_outcome(self, event: Event) -> Optional[EventResponse]:
+        self._outcome_events_received += 1
         p = dict(event.payload)
         pnl = p.get("pnl")
         if pnl is None: return None
