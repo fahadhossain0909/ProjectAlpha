@@ -105,11 +105,12 @@ class BinanceFuturesAdapter(ExchangeAdapter):
                                 logger.error("invalid Binance aggTrade message", extra={"aitos_extra": {"symbol": symbol, "error": str(exc)}})
                                 continue
                             await queue.put((trade, symbol))
+                    logger.warning("Binance trade stream closed, reconnecting", extra={"aitos_extra": {"symbol": symbol, "mode": "direct", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.error("Binance trade stream disconnected, reconnecting", extra={"aitos_extra": {"symbol": symbol, "error": str(exc), "mode": "direct"}})
-                    await asyncio.sleep(INITIAL_BACKOFF_SECONDS)
+                    logger.error("Binance trade stream disconnected, reconnecting", extra={"aitos_extra": {"symbol": symbol, "error": str(exc), "mode": "direct", "backoff_seconds": INITIAL_BACKOFF_SECONDS}})
+                await asyncio.sleep(INITIAL_BACKOFF_SECONDS)
 
         try:
             tasks = [asyncio.create_task(consume(symbol), name=f"binance-trade-{symbol}") for symbol in symbols]
@@ -221,11 +222,12 @@ class BinanceFuturesAdapter(ExchangeAdapter):
                         except (TypeError, ValueError):
                             continue
                         yield envelope.get("data", envelope), envelope.get("stream", streams[0] if streams else "")
+                    logger.warning("Binance stream closed, reconnecting", extra={"aitos_extra": {"streams": streams, "backoff_seconds": backoff}})
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error("Binance stream disconnected, reconnecting", extra={"aitos_extra": {"error": str(exc), "backoff_seconds": backoff}})
                 if emit_reconnect:
                     yield None, "__reconnect__"
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
