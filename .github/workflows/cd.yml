@@ -156,7 +156,7 @@ jobs:
             APP_PORT=8000
             APP_HOST=0.0.0.0
 
-            COMPOSE_PROJECT_NAME=projectalpha
+            COMPOSE_PROJECT_NAME=aitos
             DOCKER_REGISTRY=ghcr.io
             DOCKER_USERNAME=${{ github.actor }}
 
