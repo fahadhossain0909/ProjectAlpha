@@ -54,6 +54,6 @@ async def test_stream_trades_uses_futures_aggtrade_direct_socket_without_hot_rec
     assert trade.symbol == "BTCUSDT"
     assert trade.price == 50000.0
     assert trade.quantity == 0.01
-    assert urls == ["wss://fstream.binance.com/ws/btcusdt@aggTrade"]
+    assert urls == ["wss://fstream.binance.com/stream?streams=btcusdt@aggTrade"]
 
     await stream.aclose()
