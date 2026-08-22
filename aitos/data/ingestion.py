@@ -65,6 +65,11 @@ class DataIngestionService(AITOSModule):
             async for trade in self._exchange.stream_trades(self._symbols): await self._handle_trade(trade)
         except asyncio.CancelledError: return
         except Exception as exc: self._errors += 1; self._trade_parse_errors += 1; logger.error("trade stream loop crashed: %s", exc)
+    async def _run_orderbook_stream(self) -> None:
+        try:
+            async for book in self._exchange.stream_order_book(self._symbols, self._orderbook_levels): await self._handle_order_book(book)
+        except asyncio.CancelledError: return
+        except Exception as exc: self._errors += 1; logger.error("order book stream loop crashed: %s", exc)
     async def _handle_kline(self, kline: Kline) -> None:
         await self._event_bus.publish(Event(topic=kline_topic(kline.symbol, kline.timeframe), payload=kline.to_dict(), source_module=self.module_id, priority=EventPriority.NORMAL))
         if self._repository is not None: await self._repository.save_kline(kline)
