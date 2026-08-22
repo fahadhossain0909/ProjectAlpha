@@ -66,12 +66,10 @@ jobs:
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
           NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          API_KEY: ${{ secrets.API_KEY }}
         run: |
           set -euo pipefail
           missing=0
-          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY REDIS_PASSWORD CLICKHOUSE_PASSWORD NEO4J_PASSWORD SECRET_KEY API_KEY; do
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY REDIS_PASSWORD CLICKHOUSE_PASSWORD NEO4J_PASSWORD; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing required GitHub Actions secret: $name"
               missing=1
@@ -114,8 +112,6 @@ jobs:
               git pull --ff-only
             fi
 
-            # Create the runtime .env on the VPS from GitHub Actions Secrets.
-            # Never commit this file to Git.
             umask 077
             cat > .env << 'ENVEOF'
             ENVIRONMENT=production
@@ -163,8 +159,6 @@ jobs:
             DOCKER_REGISTRY=ghcr.io
             DOCKER_USERNAME=${{ github.actor }}
 
-            SECRET_KEY=${{ secrets.SECRET_KEY }}
-            API_KEY=${{ secrets.API_KEY }}
             DATABASE_URL=${{ secrets.DATABASE_URL }}
             SENTRY_DSN=${{ secrets.SENTRY_DSN }}
             SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
@@ -179,15 +173,6 @@ jobs:
                 exit 1
               fi
             fi
-
-            # Required non-Binance production credentials must always be present.
-            for name in REDIS_PASSWORD CLICKHOUSE_PASSWORD NEO4J_PASSWORD SECRET_KEY API_KEY; do
-              value=$(grep -m1 "^${name}=" .env | cut -d= -f2- || true)
-              if [ -z "$value" ]; then
-                echo "::error::Required runtime secret $name is empty"
-                exit 1
-              fi
-            done
 
             docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
 
