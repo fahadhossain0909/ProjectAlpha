@@ -215,19 +215,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
-      - name: Validate Docker Compose syntax (fast)
-        run: docker compose config
-      - name: Create .env file
+      - name: Prepare safe CI environment
         run: |
-          if [ -f .env.example ]; then
-            cp .env.example .env
-          else
-            cat > .env << EOF
-          DATABASE_URL=${{ secrets.DATABASE_URL }}
-          API_KEY=${{ secrets.API_KEY }}
-          SECRET_KEY=${{ secrets.SECRET_KEY }}
-          EOF
-          fi
+          set -euo pipefail
+          cp .env.example .env
       - name: Validate Docker Compose configuration
         run: docker compose config >/dev/null
       - name: Lowercase repository name
