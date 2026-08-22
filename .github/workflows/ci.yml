@@ -215,6 +215,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
+      - name: Validate Docker Compose syntax (fast)
+        run: docker compose config
       - name: Create .env file
         run: |
           if [ -f .env.example ]; then
