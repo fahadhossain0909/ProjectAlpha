@@ -55,6 +55,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: publish-image
+    environment: papertrade
 
     steps:
       - name: Check required deployment secrets
